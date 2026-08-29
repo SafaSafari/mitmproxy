@@ -35,6 +35,7 @@ from typing import TypeVar
 import mitmproxy_rs
 from mitmproxy import ctx
 from mitmproxy import flow
+from mitmproxy import hotspot
 from mitmproxy import platform
 from mitmproxy.connection import Address
 from mitmproxy.net import local_ip
@@ -194,7 +195,7 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
             ctx.master, reader, writer, ctx.options, self.mode
         )
         handler.layer = self.make_top_layer(handler.layer.context)
-        if isinstance(self.mode, mode_specs.TransparentMode):
+        if isinstance(self.mode, (mode_specs.TransparentMode, mode_specs.HotspotMode)):
             assert isinstance(writer, asyncio.StreamWriter)
             s = cast(socket.socket, writer.get_extra_info("socket"))
             try:
@@ -498,6 +499,68 @@ class Socks5Instance(AsyncioServerInstance[mode_specs.Socks5Mode]):
 class DnsInstance(AsyncioServerInstance[mode_specs.DnsMode]):
     def make_top_layer(self, context: Context) -> Layer:
         return layers.DNSLayer(context)
+
+
+class HotspotInstance(AsyncioServerInstance[mode_specs.HotspotMode]):
+    """
+    A transparent listener plus the Wi-Fi hotspot that feeds it.
+
+    The listener is started first so that we know which port to redirect to,
+    which matters when the user asked for an ephemeral port.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._backend: hotspot.HotspotBackend | None = None
+        self._status: hotspot.HotspotStatus | None = None
+
+    def make_top_layer(self, context: Context) -> Layer:
+        return layers.modes.TransparentProxy(context)
+
+    @property
+    def status(self) -> hotspot.HotspotStatus | None:
+        """The hotspot that is currently running, or `None`."""
+        return self._status
+
+    def to_json(self) -> dict:
+        return {
+            "hotspot": self._status.to_json() if self._status else None,
+            **super().to_json(),
+        }
+
+    async def _start(self) -> None:
+        await super()._start()
+        _, port, *_ = self.listen_addrs[0]
+        try:
+            backend = hotspot.create_backend(self.mode.config, port)
+            self._status = await backend.start()
+        except Exception:
+            # don't leave the listener behind if there is no hotspot to feed it.
+            await super()._stop()
+            raise
+        self._backend = backend
+
+        status = self._status
+        where = f" on {status.address}" if status.address else ""
+        how = (
+            f"redirected via {status.redirector}"
+            if status.redirector
+            else "not redirected"
+        )
+        logger.info(
+            f"Hotspot {status.ssid!r} is up{where} "
+            f"(backend: {status.backend}, interface: {status.interface}, traffic {how}). "
+            f"Connect a device and install mitmproxy's certificate from http://mitm.it."
+        )
+
+    async def _stop(self) -> None:
+        try:
+            if self._backend is not None:
+                backend, self._backend = self._backend, None
+                self._status = None
+                await backend.stop()
+        finally:
+            await super()._stop()
 
 
 class TunInstance(ServerInstance[mode_specs.TunMode]):

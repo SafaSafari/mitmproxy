@@ -21,6 +21,7 @@ You can use any of the modes with any of the mitmproxy tools (mitmproxy, mitmweb
 ### Advanced Modes
 
 - [Transparent](#transparent-proxy): Capture traffic with custom network routes.
+- [Hotspot](#hotspot): Create a Wi-Fi access point that intercepts all of its clients.
 - [TUN Interface](#tun-interface): Create a virtual network device to capture traffic.
 - [Upstream](#upstream-proxy): Chain two HTTP(S) proxies.
 - [SOCKS](#socks-proxy): Run a SOCKS5 proxy server.
@@ -378,6 +379,96 @@ and much will depend on the router or packet filter you're using. In
 most cases, the configuration will look like this:
 
 {{< figure src="/schematics/proxy-modes-transparent-3.png" >}}
+
+## Hotspot
+
+*Availability: Linux, macOS, Windows*
+
+```shell
+sudo mitmdump --mode hotspot
+```
+
+Hotspot mode turns the machine running mitmproxy into a Wi-Fi access point and
+transparently intercepts everything its clients send. It is the quickest way to
+capture a device that cannot be configured to use a proxy at all -- a smart TV,
+a games console, or an IoT gadget.
+
+Under the hood this combines two things that mitmproxy can otherwise only do
+separately: it creates the access point using the operating system's own tooling,
+and it then installs the packet filter rules that send client traffic into a
+[transparent](#transparent-proxy) listener. Both halves are torn down again when
+mitmproxy exits.
+
+Clients still need to trust mitmproxy's certificate. Connect a device to the new
+network and open [mitm.it](http://mitm.it) as usual.
+
+### Configuration
+
+The mode takes a comma-separated list of `key=value` pairs:
+
+```shell
+sudo mitmdump --mode hotspot:ssid=my-network,password=hunter22,iface=wlan0
+```
+
+A bare value is taken as the network name, so `--mode hotspot:my-network` works too.
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `ssid` | `mitmproxy` | The network name clients will see. |
+| `password` | `mitmproxy` | The WPA2 passphrase, 8-63 characters. Pass `password=` for an open network. |
+| `iface` | autodetected | The wireless interface that hosts the access point. |
+| `share` | default route | The uplink interface that provides internet access. |
+| `gateway` | backend default | The address clients use as their gateway. Mostly useful with `backend=manual`. |
+| `band` | `bg` | `bg` for 2.4 GHz or `a` for 5 GHz. |
+| `backend` | autodetected | Force a specific backend, see below. |
+| `quic` | `block` | `allow` lets clients speak QUIC. See [QUIC](#quic) below. |
+| `redirect` | `on` | `off` creates the access point but does not intercept its traffic. |
+
+### Backends
+
+mitmproxy picks the first backend that works on your machine:
+
+| Backend | Platform | Notes |
+| ------- | -------- | ----- |
+| `nmcli` | Linux | Uses NetworkManager, which also provides DHCP, DNS, and NAT. Preferred. |
+| `hostapd` | Linux | Runs `hostapd` and `dnsmasq` directly for systems without NetworkManager. |
+| `internetsharing` | macOS | Uses macOS Internet Sharing. |
+| `winhotspot` | Windows | Uses the Windows Mobile Hotspot, falling back to the legacy hosted network. |
+| `manual` | any | Does not create anything, see below. |
+
+Traffic is redirected with nftables or iptables on Linux, with `pf` on macOS, and
+with WinDivert on Windows.
+
+#### Using an existing access point
+
+If you already have an access point -- a phone in tethering mode, a travel router,
+or a hotspot you set up by hand -- the `manual` backend skips the access point
+creation and only installs the redirection rules:
+
+```shell
+sudo mitmdump --mode hotspot:backend=manual,iface=bridge100,gateway=192.168.2.1
+```
+
+This is also the fallback on recent macOS versions, which require Internet Sharing
+to be enabled once through *System Settings > General > Sharing*.
+
+### QUIC
+
+mitmproxy's transparent listener only handles TCP, so a browser speaking HTTP/3
+would sail straight past it. By default, hotspot mode therefore drops UDP port 443
+from clients, which makes browsers fall back to TCP. Pass `quic=allow` to keep
+QUIC working -- that traffic will then not be intercepted.
+
+### Requirements
+
+- Hotspot mode needs root privileges on Linux and macOS, and administrator
+  privileges on Windows.
+- Your wireless adapter must be able to act as an access point. On Linux you can
+  check with `iw list | grep -A 10 "Supported interface modes"`, which should list `AP`.
+- On Windows, the redirector always uses port 8080, so keep the default listen port.
+- The access point runs on the interface it is hosted on, so on a machine with a
+  single Wi-Fi adapter you need a second connection (Ethernet, USB tethering) as
+  the uplink.
 
 ## TUN Interface
 

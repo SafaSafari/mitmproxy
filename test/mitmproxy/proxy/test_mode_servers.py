@@ -11,6 +11,7 @@ from ...conftest import no_ipv6
 from ...conftest import skip_not_linux
 import mitmproxy.platform
 import mitmproxy_rs
+from mitmproxy import hotspot
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.proxy.mode_servers import LocalRedirectorInstance
 from mitmproxy.proxy.mode_servers import ServerInstance
@@ -32,6 +33,7 @@ def test_make():
         "transparent",
         "reverse:example.com",
         "socks5",
+        "hotspot",
     ]:
         inst = ServerInstance.make(mode, manager)
         assert inst
@@ -452,6 +454,58 @@ async def test_tun_mode(monkeypatch, caplog):
         writer.close()
         await writer.wait_closed()
         await inst.stop()
+
+
+async def test_hotspot_mode(monkeypatch, caplog_async):
+    """The hotspot instance binds first, then hands the real port to the backend."""
+    caplog_async.set_level("INFO")
+    backend = Mock()
+    backend.start = AsyncMock(
+        return_value=hotspot.HotspotStatus(
+            backend="nmcli",
+            ssid="my-network",
+            password="hunter22",
+            interface="wlan0",
+            address="10.42.0.1",
+            redirector="nftables",
+        )
+    )
+    backend.stop = AsyncMock()
+    create_backend = Mock(return_value=backend)
+    monkeypatch.setattr(hotspot, "create_backend", create_backend)
+
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot:my-network@127.0.0.1:0", MagicMock())
+        await inst.start()
+        assert inst.is_running
+        assert await caplog_async.await_log("Hotspot 'my-network' is up on 10.42.0.1")
+
+        config, port = create_backend.call_args[0]
+        assert config.ssid == "my-network"
+        assert port == inst.listen_addrs[0][1] != 0
+
+        assert inst.status is not None
+        assert inst.to_json()["hotspot"]["redirector"] == "nftables"
+
+        await inst.stop()
+        backend.stop.assert_awaited_once()
+        assert inst.status is None
+        assert not inst.is_running
+
+
+async def test_hotspot_mode_failure(monkeypatch):
+    """A hotspot that cannot start must not leave its listener behind."""
+    monkeypatch.setattr(
+        hotspot,
+        "create_backend",
+        Mock(side_effect=hotspot.HotspotError("no wifi card")),
+    )
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot@127.0.0.1:0", MagicMock())
+        with pytest.raises(hotspot.HotspotError, match="no wifi card"):
+            await inst.start()
+        assert not inst.is_running
+        assert inst.listen_addrs == ()
 
 
 async def test_tun_mode_mocked(monkeypatch):

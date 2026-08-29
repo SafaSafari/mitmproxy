@@ -72,6 +72,10 @@ def test_parse_specific_modes():
     assert ProxyMode.parse("wireguard@51821").listen_port() == 51821
     assert ProxyMode.parse("tun")
     assert ProxyMode.parse("tun:utun42")
+    assert ProxyMode.parse("hotspot")
+    assert ProxyMode.parse("hotspot:my-network").config.ssid == "my-network"
+    assert ProxyMode.parse("hotspot:ssid=x,iface=wlan0").config.interface == "wlan0"
+    assert "my-network" in ProxyMode.parse("hotspot:my-network").description
 
     assert ProxyMode.parse("local")
 
@@ -95,3 +99,6 @@ def test_parse_specific_modes():
 
     with pytest.raises(ValueError, match="invalid intercept spec"):
         ProxyMode.parse("local:,,,")
+
+    with pytest.raises(ValueError, match="invalid hotspot option"):
+        ProxyMode.parse("hotspot:nope=1")

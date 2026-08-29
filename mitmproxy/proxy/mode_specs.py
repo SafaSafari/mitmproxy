@@ -34,6 +34,7 @@ from typing import ClassVar
 from typing import Literal
 
 import mitmproxy_rs
+from mitmproxy import hotspot
 from mitmproxy.coretypes.serializable import Serializable
 from mitmproxy.net import server_spec
 
@@ -321,6 +322,26 @@ class TunMode(ProxyMode):
                 f"Invalid tun name: {self.data}. "
                 f"On macOS, the tun name must be the form utunx where x is a number, such as utun3."
             )
+
+
+class HotspotMode(ProxyMode):
+    """
+    A Wi-Fi hotspot whose clients are transparently intercepted.
+
+    mitmproxy brings up an access point using the operating system's own tooling
+    and then redirects everything its clients send into a transparent listener,
+    so that devices which cannot be configured to use a proxy can still be
+    inspected. See https://docs.mitmproxy.org/dev/concepts-modes/#hotspot.
+    """
+
+    description = "Wi-Fi hotspot"
+    transport_protocol = TCP
+    config: hotspot.HotspotConfig
+
+    # noinspection PyDataclass
+    def __post_init__(self) -> None:
+        self.config = hotspot.HotspotConfig.parse(self.data)
+        self.description = f"{self.description} ({self.config.ssid})"
 
 
 class OsProxyMode(ProxyMode):  # pragma: no cover

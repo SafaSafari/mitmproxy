@@ -288,7 +288,10 @@ class Proxyserver(ServerManager):
 
             if ctx.options.mode and not ctx.master.addons.get("nextlayer"):
                 logger.warning("Warning: Running proxyserver without nextlayer addon!")
-            if any(isinstance(m, mode_specs.TransparentMode) for m in modes):
+            # hotspot mode redirects its clients into a transparent listener,
+            # so it needs the same platform support to recover the original destination.
+            transparent_modes = (mode_specs.TransparentMode, mode_specs.HotspotMode)
+            if any(isinstance(m, transparent_modes) for m in modes):
                 if platform.original_addr:
                     platform.init_transparent_mode()
                 else:
