@@ -421,7 +421,7 @@ A bare value is taken as the network name, so `--mode hotspot:my-network` works 
 | `iface` | autodetected | The wireless interface that hosts the access point. |
 | `share` | default route | The uplink interface that provides internet access. |
 | `gateway` | backend default | The address clients use as their gateway. Mostly useful with `backend=manual`. |
-| `band` | `bg` | `bg` for 2.4 GHz or `a` for 5 GHz. |
+| `band` | 5 GHz first | Pin to `a` (5 GHz) or `bg` (2.4 GHz). Unset tries 5 GHz and falls back to 2.4 GHz. |
 | `capture` | `auto` | How traffic reaches mitmproxy, see [Capture methods](#capture-methods). |
 | `tun` | `tun0` | A fixed name for the tun interface, with `capture=tun`. |
 | `backend` | autodetected | Force a specific backend, see below. |
@@ -513,6 +513,9 @@ sudo mitmdump --mode hotspot:ssid=my-network,password=hunter22
   privileges on Windows -- either directly or through `sudo`, see above.
 - Your wireless adapter must be able to act as an access point. On Linux you can
   check with `iw list | grep -A 10 "Supported interface modes"`, which should list `AP`.
+- The access point is brought up on 5 GHz where possible, falling back to 2.4 GHz.
+  Not every adapter or regulatory domain allows hosting on 5 GHz; pin the band
+  with `band=bg` or `band=a` if the automatic choice is wrong.
 - `capture=tun` is Linux-only for now; elsewhere `capture=auto` falls back to
   `capture=redirect`.
 - With `capture=redirect` on Windows, the redirector always uses port 8080, so

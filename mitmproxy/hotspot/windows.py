@@ -49,6 +49,12 @@ _START_TEMPLATE = """
 $config = $manager.GetCurrentAccessPointConfiguration()
 $config.Ssid = "{ssid}"
 $config.Passphrase = "{password}"
+# Band selection needs Windows 10 2004 or newer, and not every adapter can host
+# an access point on every band -- fall back to the driver's choice if not.
+try {{
+    $band = [Windows.Networking.NetworkOperators.TetheringWiFiBand]::{band}
+    if ($config.IsBandSupported($band)) {{ $config.Band = $band }}
+}} catch {{ }}
 Await ($manager.ConfigureAccessPointAsync($config)) $resultType | Out-Null
 $result = Await ($manager.StartTetheringAsync()) $resultType
 # 0 is Success, 1 is "already on".
@@ -105,8 +111,15 @@ class MobileHotspotBackend(HotspotBackend):
         self.hosted_network = True
 
     async def start(self) -> HotspotStatus:
+        # Windows picks the band itself once configured, so unlike the Linux
+        # backends we only state a preference rather than retrying per band.
+        band = (
+            "FiveGigahertz" if self.config.bands[0] == "a" else "TwoPointFourGigahertz"
+        )
         script = _AWAIT_HELPER + _START_TEMPLATE.format(
-            ssid=_quote(self.config.ssid), password=_quote(self.config.password or "")
+            ssid=_quote(self.config.ssid),
+            password=_quote(self.config.password or ""),
+            band=band,
         )
         try:
             await self.powershell(script)
@@ -130,6 +143,7 @@ class MobileHotspotBackend(HotspotBackend):
             # Windows does not expose a stable adapter name for the hotspot,
             # and the WinDivert redirector does not filter by interface anyway.
             interface=self.config.interface or "Local Area Connection* 1",
+            band=self.config.band,
             address=None,
         )
         try:

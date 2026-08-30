@@ -27,11 +27,16 @@ import signal
 import tempfile
 from pathlib import Path
 
+from mitmproxy.hotspot.base import CommandRunner
+from mitmproxy.hotspot.base import elevate
 from mitmproxy.hotspot.base import HotspotBackend
 from mitmproxy.hotspot.base import HotspotError
 from mitmproxy.hotspot.base import HotspotStatus
+from mitmproxy.hotspot.base import is_root
+from mitmproxy.hotspot.base import run
 from mitmproxy.hotspot.base import TrafficRedirector
 from mitmproxy.hotspot.base import which
+from mitmproxy.hotspot.base import will_elevate
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,71 @@ ROUTE_TABLE = "8420"
 """The routing table that holds the default route into mitmproxy's tun interface."""
 ROUTE_PRIORITY = "8420"
 """The `ip rule` priority that sends client traffic to `ROUTE_TABLE`."""
+
+DEFAULT_TUN_NAME = "mitmproxy0"
+"""
+The tun interface we pre-create for an unprivileged mitmproxy.
+
+Pre-creating needs a name we can pass to `ip`, so we cannot let the kernel pick.
+"""
+
+
+async def provision_tun_device(
+    name: str | None,
+    sudo: str = "auto",
+    runner: CommandRunner = run,
+) -> tuple[str | None, bool]:
+    """
+    Make sure this process is allowed to open a tun device.
+
+    Opening `/dev/net/tun` to *create* an interface needs `CAP_NET_ADMIN`, which
+    an unprivileged mitmproxy does not have -- but *attaching* to an interface
+    that already exists and is owned by us does not. So when we are not root, we
+    have `sudo` pre-create a persistent device in our name and attach to that.
+
+    Returns the interface name to open -- `None` lets the kernel pick one -- and
+    whether we created it, i.e. whether it has to be removed again afterwards.
+    """
+    if is_root() or not will_elevate(sudo) or not which("ip"):
+        # either we can create the device ourselves, or we have no way to ask.
+        return name, False
+
+    name = name or DEFAULT_TUN_NAME
+    try:
+        await elevate(runner, sudo)(
+            "ip",
+            "tuntap",
+            "add",
+            "dev",
+            name,
+            "mode",
+            "tun",
+            "user",
+            str(os.geteuid()),
+        )
+    except HotspotError as e:
+        if "File exists" not in str(e):
+            raise
+        # left over from a previous run; reuse it, but leave it alone on shutdown.
+        logger.debug(f"Reusing the existing tun interface {name}.")
+        return name, False
+    return name, True
+
+
+async def release_tun_device(
+    name: str,
+    sudo: str = "auto",
+    runner: CommandRunner = run,
+) -> None:
+    """Remove a tun interface created by `provision_tun_device`."""
+    await elevate(runner, sudo)(
+        "ip", "tuntap", "del", "dev", name, "mode", "tun", check=False
+    )
+
+
+def _band_name(band: str) -> str:
+    """A human-readable name for an 802.11 band, for log messages."""
+    return "5 GHz" if band == "a" else "2.4 GHz"
 
 
 def wireless_interfaces() -> list[str]:
@@ -113,6 +183,45 @@ class NetworkManagerBackend(_LinuxBackend):
             return m.group(1)
         return None
 
+    async def bring_up(self, bands: tuple[str, ...]) -> str:
+        """
+        Activate the access point, trying each of `bands` in turn.
+
+        Returns the band that worked; raises the last error if none did.
+        """
+        for i, band in enumerate(bands):
+            settings = [
+                "802-11-wireless.mode",
+                "ap",
+                "802-11-wireless.band",
+                band,
+                # `shared` makes NetworkManager run DHCP + DNS and set up NAT.
+                "ipv4.method",
+                "shared",
+                "ipv6.method",
+                "ignore",
+            ]
+            if self.config.password:
+                settings += [
+                    "wifi-sec.key-mgmt",
+                    "wpa-psk",
+                    "wifi-sec.psk",
+                    self.config.password,
+                ]
+            await self.run("nmcli", "connection", "modify", CONNECTION_NAME, *settings)
+            try:
+                await self.run("nmcli", "connection", "up", CONNECTION_NAME)
+            except HotspotError as e:
+                if i == len(bands) - 1:
+                    raise
+                logger.info(
+                    f"Could not start the access point on {_band_name(band)} ({e}), "
+                    f"falling back to {_band_name(bands[i + 1])}."
+                )
+            else:
+                return band
+        raise AssertionError  # pragma: no cover -- bands is never empty
+
     async def start(self) -> HotspotStatus:
         interface = await self.wifi_interface()
 
@@ -136,26 +245,7 @@ class NetworkManagerBackend(_LinuxBackend):
             # fmt: on
         )
         try:
-            settings = [
-                "802-11-wireless.mode",
-                "ap",
-                "802-11-wireless.band",
-                self.config.band or "bg",
-                # `shared` makes NetworkManager run DHCP + DNS and set up NAT.
-                "ipv4.method",
-                "shared",
-                "ipv6.method",
-                "ignore",
-            ]
-            if self.config.password:
-                settings += [
-                    "wifi-sec.key-mgmt",
-                    "wpa-psk",
-                    "wifi-sec.psk",
-                    self.config.password,
-                ]
-            await self.run("nmcli", "connection", "modify", CONNECTION_NAME, *settings)
-            await self.run("nmcli", "connection", "up", CONNECTION_NAME)
+            band = await self.bring_up(self.config.bands)
         except HotspotError:
             await self.run(
                 "nmcli", "connection", "delete", CONNECTION_NAME, check=False
@@ -167,6 +257,7 @@ class NetworkManagerBackend(_LinuxBackend):
             ssid=self.config.ssid,
             password=self.config.password,
             interface=interface,
+            band=band,
             address=await self.gateway_address(CONNECTION_NAME),
         )
         try:
@@ -207,13 +298,13 @@ class HostapdBackend(_LinuxBackend):
             "Specify one explicitly with `--mode hotspot:iface=<interface>`."
         )
 
-    def hostapd_conf(self, interface: str) -> str:
+    def hostapd_conf(self, interface: str, band: str) -> str:
         conf = [
             f"interface={interface}",
             "driver=nl80211",
             f"ssid={self.config.ssid}",
-            f"hw_mode={'a' if self.config.band == 'a' else 'g'}",
-            "channel=36" if self.config.band == "a" else "channel=6",
+            f"hw_mode={'a' if band == 'a' else 'g'}",
+            "channel=36" if band == "a" else "channel=6",
             "auth_algs=1",
             "wmm_enabled=1",
         ]
@@ -245,14 +336,38 @@ class HostapdBackend(_LinuxBackend):
             + "\n"
         )
 
+    async def bring_up(self, interface: str, bands: tuple[str, ...]) -> str:
+        """
+        Start `hostapd`, trying each of `bands` in turn.
+
+        Returns the band that worked; raises the last error if none did.
+        """
+        assert self.rundir
+        conf = self.rundir / "hostapd.conf"
+        for i, band in enumerate(bands):
+            conf.write_text(self.hostapd_conf(interface, band))
+            try:
+                await self.run_elevated(
+                    "hostapd", "-B", "-P", str(self.rundir / "hostapd.pid"), str(conf)
+                )
+            except HotspotError as e:
+                if i == len(bands) - 1:
+                    raise
+                logger.info(
+                    f"hostapd could not start the access point on {_band_name(band)} "
+                    f"({e}), falling back to {_band_name(bands[i + 1])}."
+                )
+            else:
+                return band
+        raise AssertionError  # pragma: no cover -- bands is never empty
+
     async def start(self) -> HotspotStatus:
         interface = self.interface = await self.wifi_interface()
         self.uplink = await self.default_route_interface()
         self.rundir = Path(tempfile.mkdtemp(prefix="mitmproxy-hotspot-"))
-        hostapd_conf = self.rundir / "hostapd.conf"
         dnsmasq_conf = self.rundir / "dnsmasq.conf"
-        hostapd_conf.write_text(self.hostapd_conf(interface))
         dnsmasq_conf.write_text(self.dnsmasq_conf(interface))
+        band: str | None = None
 
         try:
             await self.run_elevated("ip", "link", "set", "dev", interface, "down")
@@ -266,13 +381,7 @@ class HostapdBackend(_LinuxBackend):
                 interface,
             )
             await self.run_elevated("ip", "link", "set", "dev", interface, "up")
-            await self.run_elevated(
-                "hostapd",
-                "-B",
-                "-P",
-                str(self.rundir / "hostapd.pid"),
-                str(hostapd_conf),
-            )
+            band = await self.bring_up(interface, self.config.bands)
             await self.run_elevated(
                 "dnsmasq",
                 f"--conf-file={dnsmasq_conf}",
@@ -290,6 +399,7 @@ class HostapdBackend(_LinuxBackend):
             ssid=self.config.ssid,
             password=self.config.password,
             interface=interface,
+            band=band,
             address=HOSTAPD_GATEWAY,
         )
         try:

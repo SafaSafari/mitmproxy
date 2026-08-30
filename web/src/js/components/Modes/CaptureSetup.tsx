@@ -85,6 +85,7 @@ function HotspotDetails({
     ssid,
     password,
     interface: iface,
+    band,
     address,
     capture,
     redirector,
@@ -114,7 +115,10 @@ function HotspotDetails({
                     </>
                 )}
                 <dt>Interface</dt>
-                <dd>{iface}</dd>
+                <dd>
+                    {iface}
+                    {band && ` (${band === "a" ? "5 GHz" : "2.4 GHz"})`}
+                </dd>
                 {address && (
                     <>
                         <dt>Gateway</dt>

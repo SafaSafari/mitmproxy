@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -111,13 +112,13 @@ class TestHostapd:
 
     def test_hostapd_conf(self, monkeypatch):
         b = self.backend(FakeRunner(), monkeypatch, ssid="net", password="hunter22")
-        conf = b.hostapd_conf("wlan0")
+        conf = b.hostapd_conf("wlan0", "bg")
         assert "ssid=net" in conf
         assert "wpa_passphrase=hunter22" in conf
         assert "hw_mode=g" in conf
 
-        b = self.backend(FakeRunner(), monkeypatch, band="a", password="")
-        conf = b.hostapd_conf("wlan0")
+        b = self.backend(FakeRunner(), monkeypatch, password="")
+        conf = b.hostapd_conf("wlan0", "a")
         assert "hw_mode=a" in conf
         assert "channel=36" in conf
         assert "wpa" not in conf
@@ -312,3 +313,155 @@ class TestTunRouter:
         monkeypatch.setattr(linux, "which", lambda *a: True)
         r = hotspot.create_redirector("wlan0", None, target(tun="tun0"))
         assert isinstance(r, linux.TunRouter)
+
+
+class TestTunProvisioning:
+    """An unprivileged mitmproxy cannot create a tun device, but sudo can do it for us."""
+
+    async def test_skipped_when_root(self, monkeypatch):
+        monkeypatch.setattr(linux, "is_root", lambda: True)
+        runner = FakeRunner()
+        assert await linux.provision_tun_device(None, "auto", runner) == (None, False)
+        assert runner.calls == []
+
+    async def test_skipped_without_sudo(self, monkeypatch):
+        monkeypatch.setattr(linux, "is_root", lambda: False)
+        monkeypatch.setattr(linux, "will_elevate", lambda mode: False)
+        runner = FakeRunner()
+        assert await linux.provision_tun_device("tun9", "never", runner) == (
+            "tun9",
+            False,
+        )
+        assert runner.calls == []
+
+    async def test_skipped_without_ip(self, monkeypatch):
+        monkeypatch.setattr(linux, "is_root", lambda: False)
+        monkeypatch.setattr(linux, "will_elevate", lambda mode: True)
+        monkeypatch.setattr(linux, "which", lambda *a: False)
+        runner = FakeRunner()
+        assert await linux.provision_tun_device(None, "auto", runner) == (None, False)
+        assert runner.calls == []
+
+    async def test_creates_device_owned_by_us(self, monkeypatch):
+        monkeypatch.setattr(linux, "is_root", lambda: False)
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        monkeypatch.setattr(linux.os, "geteuid", lambda: 1234)
+        runner = FakeRunner()
+
+        name, created = await linux.provision_tun_device(None, "always", runner)
+        assert (name, created) == (linux.DEFAULT_TUN_NAME, True)
+        assert runner.ran(
+            f"sudo -n ip tuntap add dev {linux.DEFAULT_TUN_NAME} mode tun user 1234"
+        )
+
+    async def test_honours_an_explicit_name(self, monkeypatch):
+        monkeypatch.setattr(linux, "is_root", lambda: False)
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        runner = FakeRunner()
+        name, created = await linux.provision_tun_device("mitm7", "always", runner)
+        assert (name, created) == ("mitm7", True)
+        assert runner.ran("ip tuntap add dev mitm7")
+
+    async def test_reuses_a_leftover_device(self, monkeypatch):
+        """A device left behind by a crash is fine to attach to, but not ours to delete."""
+        monkeypatch.setattr(linux, "is_root", lambda: False)
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+
+        async def exists(*args, **kwargs):
+            raise HotspotError("ioctl(TUNSETIFF): File exists")
+
+        assert await linux.provision_tun_device(None, "always", exists) == (
+            linux.DEFAULT_TUN_NAME,
+            False,
+        )
+
+    async def test_other_errors_propagate(self, monkeypatch):
+        monkeypatch.setattr(linux, "is_root", lambda: False)
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+
+        async def boom(*args, **kwargs):
+            raise HotspotError("sudo: a password is required")
+
+        # `elevate` turns this into its own actionable message; either way it must
+        # not be swallowed the way a pre-existing device is.
+        with pytest.raises(HotspotError, match="NOPASSWD"):
+            await linux.provision_tun_device(None, "always", boom)
+
+    async def test_release(self):
+        runner = FakeRunner()
+        await linux.release_tun_device("mitm7", "always", runner)
+        assert runner.ran("sudo -n ip tuntap del dev mitm7 mode tun")
+
+
+class TestBandFallback:
+    """5 GHz is worth trying first, but not every adapter can host an AP there."""
+
+    async def test_nmcli_prefers_5ghz(self, monkeypatch):
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        runner = FakeRunner({"nmcli -t -f DEVICE,TYPE": "wlan0:wifi\n"})
+        b = linux.NetworkManagerBackend(config(), target(), runner)
+        status = await b.start()
+        assert status.band == "a"
+        assert runner.ran("802-11-wireless.band a")
+        assert not runner.ran("802-11-wireless.band bg")
+
+    async def test_nmcli_falls_back_to_24ghz(self, monkeypatch, caplog):
+        caplog.set_level("INFO")
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        calls = {"n": 0}
+        base = FakeRunner({"nmcli -t -f DEVICE,TYPE": "wlan0:wifi\n"})
+
+        async def runner(*args, **kwargs):
+            if " ".join(args).startswith("nmcli connection up"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise HotspotError("802-11-wireless.band: band a is not supported")
+            return await base(*args, **kwargs)
+
+        b = linux.NetworkManagerBackend(config(), target(), runner)
+        status = await b.start()
+        assert status.band == "bg"
+        assert base.ran("802-11-wireless.band a")
+        assert base.ran("802-11-wireless.band bg")
+        assert "falling back to 2.4 GHz" in caplog.text
+
+    async def test_nmcli_pinned_band_does_not_fall_back(self, monkeypatch):
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        runner = FakeRunner(
+            {"nmcli -t -f DEVICE,TYPE": "wlan0:wifi\n"}, fail=("nmcli connection up",)
+        )
+        b = linux.NetworkManagerBackend(config(band="a"), target(), runner)
+        with pytest.raises(HotspotError):
+            await b.start()
+        assert not runner.ran("802-11-wireless.band bg")
+
+    async def test_hostapd_prefers_5ghz(self, monkeypatch):
+        monkeypatch.setattr(linux.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        runner = FakeRunner()
+        b = linux.HostapdBackend(config(interface="wlan0"), target(), runner)
+        status = await b.start()
+        assert status.band == "a"
+
+    async def test_hostapd_falls_back_to_24ghz(self, monkeypatch, caplog):
+        caplog.set_level("INFO")
+        monkeypatch.setattr(linux.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        configs = []
+        calls = {"n": 0}
+        base = FakeRunner()
+
+        async def runner(*args, **kwargs):
+            if args[0] == "hostapd":
+                configs.append(Path(args[-1]).read_text())
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise HotspotError("Could not set channel for kernel driver")
+            return await base(*args, **kwargs)
+
+        b = linux.HostapdBackend(config(interface="wlan0"), target(), runner)
+        status = await b.start()
+        assert status.band == "bg"
+        assert "hw_mode=a" in configs[0]
+        assert "hw_mode=g" in configs[1]
+        assert "falling back to 2.4 GHz" in caplog.text

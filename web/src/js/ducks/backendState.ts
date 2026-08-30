@@ -13,6 +13,7 @@ export interface HotspotInfo {
     ssid: string;
     password: string | null;
     interface: string;
+    band: string | null;
     address: string | null;
     capture: string;
     redirector: string | null;

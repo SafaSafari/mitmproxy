@@ -14,6 +14,7 @@
   When mitmproxy itself is not root, the privileged commands are run through `sudo -n` (configurable with `sudo=`).
   On Linux, client traffic is routed into a TUN interface by default (`capture=tun`), which captures UDP and therefore
   QUIC/HTTP3 as well; `capture=redirect` selects the TCP-only packet filter redirect used on other platforms.
+  The access point is brought up on 5 GHz where the adapter allows it, falling back to 2.4 GHz.
   The mode can also be configured from mitmweb's Capture tab.
 - Replace deprecated pyparsing APIs with their snake_case equivalents to avoid
   `PyparsingDeprecationWarning` during command and flow-filter parsing.

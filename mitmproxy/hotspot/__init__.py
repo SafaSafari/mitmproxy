@@ -24,7 +24,10 @@ from mitmproxy.hotspot.base import HotspotBackend
 from mitmproxy.hotspot.base import HotspotConfig
 from mitmproxy.hotspot.base import HotspotError
 from mitmproxy.hotspot.base import HotspotStatus
+from mitmproxy.hotspot.base import is_root
 from mitmproxy.hotspot.base import TrafficRedirector
+from mitmproxy.hotspot.linux import provision_tun_device
+from mitmproxy.hotspot.linux import release_tun_device
 
 __all__ = [
     "BACKEND_NAMES",
@@ -37,4 +40,7 @@ __all__ = [
     "TrafficRedirector",
     "create_backend",
     "create_redirector",
+    "is_root",
+    "provision_tun_device",
+    "release_tun_device",
 ]

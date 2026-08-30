@@ -532,6 +532,8 @@ class HotspotInstance(AsyncioServerInstance[mode_specs.HotspotMode]):
         self._backend: hotspot.HotspotBackend | None = None
         self._status: hotspot.HotspotStatus | None = None
         self._tun: mitmproxy_rs.tun.TunInterface | None = None
+        self._provisioned_tun: str | None = None
+        """The tun interface we created ourselves and therefore have to remove."""
 
     def make_top_layer(self, context: Context) -> Layer:
         return layers.modes.TransparentProxy(context)
@@ -592,13 +594,21 @@ class HotspotInstance(AsyncioServerInstance[mode_specs.HotspotMode]):
         """Create the device or listener that client traffic will be steered into."""
         if self.mode.config.capture_method == "tun":
             assert self._tun is None
+            config = self.mode.config
+            # an unprivileged mitmproxy cannot create a tun device, but it can
+            # attach to one that sudo pre-created in its name.
+            name, created = await hotspot.provision_tun_device(
+                config.tun_name, config.sudo
+            )
+            self._provisioned_tun = name if created else None
             try:
                 self._tun = await mitmproxy_rs.tun.create_tun_interface(
                     self.handle_stream,
                     self.handle_stream,
-                    tun_name=self.mode.config.tun_name,
+                    tun_name=name,
                 )
             except Exception as e:
+                await self._release_tun()
                 raise hotspot.HotspotError(
                     f"Failed to create the hotspot's tun interface: {e}\n"
                     f"Creating one needs root privileges (or CAP_NET_ADMIN on the "
@@ -611,11 +621,18 @@ class HotspotInstance(AsyncioServerInstance[mode_specs.HotspotMode]):
             _, port, *_ = self.listen_addrs[0]
             return hotspot.CaptureTarget(port=port)
 
+    async def _release_tun(self) -> None:
+        """Remove the tun interface we had sudo create for us, if any."""
+        if self._provisioned_tun is not None:
+            name, self._provisioned_tun = self._provisioned_tun, None
+            await hotspot.release_tun_device(name, self.mode.config.sudo)
+
     async def _stop_capture(self) -> None:
         if self._tun is not None:
             tun, self._tun = self._tun, None
             tun.close()
             await tun.wait_closed()
+            await self._release_tun()
         elif self._servers:
             await super()._stop()
 

@@ -174,7 +174,8 @@ def elevate(runner: CommandRunner, mode: str = "auto") -> CommandRunner:
                     f"password and mitmproxy cannot prompt for one.\n"
                     f"Either run mitmproxy as root, or allow this user to run the "
                     f"command without a password, e.g. by adding a sudoers rule such as\n"
-                    f"    {_username()} ALL=(root) NOPASSWD: /usr/sbin/nft, /usr/sbin/iptables\n"
+                    f"    {_username()} ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/sysctl, /usr/sbin/nft, /usr/sbin/iptables\n"
+                    f"(check the paths on your system with `command -v ip sysctl nft iptables`)\n"
                     f"Alternatively, pass `--mode hotspot:sudo=never` to run the commands "
                     f"directly, or `--mode hotspot:redirect=off` to skip them entirely."
                 ) from e
@@ -211,7 +212,7 @@ class HotspotConfig:
     redirection, so the `manual` backend usually wants this set.
     """
     band: str | None = None
-    """`bg` for 2.4 GHz or `a` for 5 GHz. Backend default if unset."""
+    """`bg` for 2.4 GHz or `a` for 5 GHz. Unset tries both, see `bands`."""
     capture: str = "auto"
     """
     How client traffic reaches mitmproxy, see `capture_method`.
@@ -309,6 +310,19 @@ class HotspotConfig:
         return cls(**values).validated()
 
     @property
+    def bands(self) -> tuple[str, ...]:
+        """
+        The bands to try, in order.
+
+        5 GHz is faster and far less congested, so it is worth attempting first.
+        Not every adapter or regulatory domain allows an access point there
+        though, so an unpinned `band` falls back to 2.4 GHz rather than failing.
+        """
+        if self.band is not None:
+            return (self.band,)
+        return ("a", "bg")
+
+    @property
     def capture_method(self) -> str:
         """
         The capture method that will actually be used: `tun` or `redirect`.
@@ -385,6 +399,8 @@ class HotspotStatus:
     password: str | None
     interface: str
     """The interface the access point runs on."""
+    band: str | None = None
+    """The band the access point ended up on: `a` (5 GHz) or `bg` (2.4 GHz)."""
     address: str | None = None
     """The gateway address that clients use, if known."""
     capture: str = "redirect"
@@ -398,6 +414,7 @@ class HotspotStatus:
             "ssid": self.ssid,
             "password": self.password,
             "interface": self.interface,
+            "band": self.band,
             "address": self.address,
             "capture": self.capture,
             "redirector": self.redirector,

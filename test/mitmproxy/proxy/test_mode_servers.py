@@ -517,7 +517,9 @@ async def test_hotspot_mode_tun(monkeypatch, caplog_async):
     monkeypatch.setattr(hotspot, "create_backend", create_backend)
 
     with taddons.context(Proxyserver()):
-        inst = ServerInstance.make("hotspot:ssid=my-network,capture=tun", MagicMock())
+        inst = ServerInstance.make(
+            "hotspot:ssid=my-network,capture=tun,sudo=never", MagicMock()
+        )
         # a tun interface resolves destinations itself, no SO_ORIGINAL_DST needed.
         assert inst.destination == "stream"
         assert inst.mode.transport_protocol == "both"
@@ -570,7 +572,7 @@ async def test_hotspot_mode_tun_failure(monkeypatch):
         Mock(side_effect=hotspot.HotspotError("no wifi card")),
     )
     with taddons.context(Proxyserver()):
-        inst = ServerInstance.make("hotspot:capture=tun", MagicMock())
+        inst = ServerInstance.make("hotspot:capture=tun,sudo=never", MagicMock())
         with pytest.raises(hotspot.HotspotError, match="no wifi card"):
             await inst.start()
         assert not inst.is_running
@@ -682,8 +684,68 @@ async def test_hotspot_mode_tun_unavailable(monkeypatch):
         AsyncMock(side_effect=RuntimeError("Failed to create TUN device")),
     )
     with taddons.context(Proxyserver()):
-        inst = ServerInstance.make("hotspot:capture=tun", MagicMock())
+        inst = ServerInstance.make("hotspot:capture=tun,sudo=never", MagicMock())
         with pytest.raises(hotspot.HotspotError, match="capture=redirect") as e:
             await inst.start()
         assert "Failed to create TUN device" in str(e.value)
         assert not inst.is_running
+
+
+async def test_hotspot_mode_tun_provisioning(monkeypatch):
+    """An unprivileged run has sudo pre-create the tun device, and removes it after."""
+    tun_interface = Mock()
+    tun_interface.tun_name = lambda: "mitmproxy0"
+    tun_interface.wait_closed = AsyncMock()
+    monkeypatch.setattr(
+        mitmproxy_rs.tun,
+        "create_tun_interface",
+        AsyncMock(return_value=tun_interface),
+    )
+    provision = AsyncMock(return_value=("mitmproxy0", True))
+    release = AsyncMock()
+    monkeypatch.setattr(hotspot, "provision_tun_device", provision)
+    monkeypatch.setattr(hotspot, "release_tun_device", release)
+
+    backend = _hotspot_backend(capture="tun", redirector="iproute2")
+    monkeypatch.setattr(hotspot, "create_backend", Mock(return_value=backend))
+
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot:capture=tun", MagicMock())
+        await inst.start()
+        assert provision.await_args[0] == (None, "auto")
+        # the pre-created device is the one we attach to
+        assert mitmproxy_rs.tun.create_tun_interface.await_args.kwargs["tun_name"] == (
+            "mitmproxy0"
+        )
+        release.assert_not_awaited()
+
+        await inst.stop()
+        release.assert_awaited_once_with("mitmproxy0", "auto")
+
+
+async def test_hotspot_mode_tun_not_ours_to_remove(monkeypatch):
+    """A device we did not create -- because we are root -- must be left alone."""
+    tun_interface = Mock()
+    tun_interface.tun_name = lambda: "tun0"
+    tun_interface.wait_closed = AsyncMock()
+    monkeypatch.setattr(
+        mitmproxy_rs.tun,
+        "create_tun_interface",
+        AsyncMock(return_value=tun_interface),
+    )
+    monkeypatch.setattr(
+        hotspot, "provision_tun_device", AsyncMock(return_value=(None, False))
+    )
+    release = AsyncMock()
+    monkeypatch.setattr(hotspot, "release_tun_device", release)
+    monkeypatch.setattr(
+        hotspot,
+        "create_backend",
+        Mock(return_value=_hotspot_backend(capture="tun", redirector="iproute2")),
+    )
+
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot:capture=tun", MagicMock())
+        await inst.start()
+        await inst.stop()
+        release.assert_not_awaited()

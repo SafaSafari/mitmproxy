@@ -225,6 +225,7 @@ class TestBackendLifecycle:
             "ssid": "net",
             "password": "mitmproxy",
             "interface": "wlan0",
+            "band": None,
             "address": "10.0.0.1",
             "capture": "redirect",
             "redirector": "fake-redirector",
