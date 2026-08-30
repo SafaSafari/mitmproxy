@@ -4,13 +4,15 @@ import pytest
 
 from .helpers import config
 from .helpers import FakeRunner
+from .helpers import target
+from mitmproxy import hotspot
 from mitmproxy.hotspot import linux
 from mitmproxy.hotspot.base import HotspotError
 
 
 class TestNetworkManager:
     def backend(self, runner, **kwargs):
-        return linux.NetworkManagerBackend(config(**kwargs), 8080, runner)
+        return linux.NetworkManagerBackend(config(**kwargs), target(), runner)
 
     async def test_start_stop(self, monkeypatch):
         monkeypatch.setattr(linux, "which", lambda *a: True)
@@ -94,7 +96,7 @@ class TestHostapd:
     def backend(self, runner, monkeypatch, **kwargs):
         monkeypatch.setattr(linux.os, "geteuid", lambda: 0)
         monkeypatch.setattr(linux, "which", lambda *a: True)
-        return linux.HostapdBackend(config(**kwargs), 8080, runner)
+        return linux.HostapdBackend(config(**kwargs), target(), runner)
 
     def test_available(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
@@ -194,7 +196,7 @@ class TestHostapd:
         killed = []
         monkeypatch.setattr(linux.os, "kill", lambda pid, sig: killed.append(pid))
 
-        b = linux.HostapdBackend(config(), 8080, FakeRunner())
+        b = linux.HostapdBackend(config(), target(), FakeRunner())
         b.terminate(tmp_path / "missing.pid")  # no pidfile: nothing to do
         (tmp_path / "bad.pid").write_text("not-a-pid")
         b.terminate(tmp_path / "bad.pid")
@@ -209,7 +211,7 @@ class TestNftablesRedirector:
     def redirector(self, runner, **kwargs):
         kwargs.setdefault("gateway", "10.42.0.1")
         return linux.NftablesRedirector(
-            "wlan0", kwargs.pop("gateway"), 8080, runner=runner, **kwargs
+            "wlan0", kwargs.pop("gateway"), target(), runner=runner, **kwargs
         )
 
     def test_ruleset(self):
@@ -245,7 +247,7 @@ class TestIptablesRedirector:
 
     async def test_start_stop(self):
         runner = FakeRunner()
-        r = linux.IptablesRedirector("wlan0", "10.42.0.1", 8080, runner=runner)
+        r = linux.IptablesRedirector("wlan0", "10.42.0.1", target(), runner=runner)
         await r.start()
         assert runner.ran("-N mitmproxy_hotspot")
         assert runner.ran("-d 10.42.0.1 -j RETURN")
@@ -258,8 +260,55 @@ class TestIptablesRedirector:
     async def test_no_gateway_no_quic(self):
         runner = FakeRunner()
         r = linux.IptablesRedirector(
-            "wlan0", None, 8080, block_quic=False, runner=runner
+            "wlan0", None, target(), block_quic=False, runner=runner
         )
         await r.start()
         assert not runner.ran("-j RETURN")
         assert not runner.ran("-I FORWARD")
+
+
+class TestTunRouter:
+    def router(self, runner, interface="wlan0", tun="tun0"):
+        return linux.TunRouter(interface, None, target(tun=tun), runner=runner)
+
+    def test_available(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        assert linux.TunRouter.available()
+        monkeypatch.setattr(linux, "which", lambda *a: False)
+        assert not linux.TunRouter.available()
+
+    def test_captures_tun(self):
+        assert linux.TunRouter.capture == "tun"
+
+    async def test_start(self):
+        runner = FakeRunner()
+        await self.router(runner).start()
+        assert runner.ran("sysctl -w net.ipv4.ip_forward=1")
+        assert runner.ran("ip link set dev tun0 up")
+        assert runner.ran("ip route add default dev tun0 table 8420")
+        assert runner.ran("ip rule add iif wlan0 lookup 8420 priority 8420")
+        assert runner.ran("ip -6 route add default dev tun0 table 8420")
+
+    async def test_start_is_idempotent(self):
+        """`ip rule add` stacks, so a start must clear a stale rule first."""
+        runner = FakeRunner()
+        await self.router(runner).start()
+        commands = [" ".join(c) for c in runner.calls]
+        first_del = next(i for i, c in enumerate(commands) if "rule del" in c)
+        first_add = next(i for i, c in enumerate(commands) if "rule add" in c)
+        assert first_del < first_add
+
+    async def test_stop(self):
+        runner = FakeRunner()
+        await self.router(runner).stop()
+        assert runner.ran("ip rule del iif wlan0 lookup 8420 priority 8420")
+        assert runner.ran("ip route flush table 8420")
+        assert runner.ran("ip -6 rule del iif wlan0")
+        assert runner.ran("ip -6 route flush table 8420")
+
+    async def test_selected_for_tun_targets(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        r = hotspot.create_redirector("wlan0", None, target(tun="tun0"))
+        assert isinstance(r, linux.TunRouter)

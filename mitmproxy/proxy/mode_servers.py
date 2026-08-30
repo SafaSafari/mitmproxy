@@ -29,6 +29,7 @@ from typing import cast
 from typing import ClassVar
 from typing import Generic
 from typing import get_args
+from typing import Literal
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -173,6 +174,17 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
     def make_top_layer(self, context: Context) -> Layer:
         pass
 
+    @property
+    def destination(self) -> Literal["spec", "original_dst", "stream"]:
+        """
+        Where the original destination of an incoming connection comes from.
+
+        `spec` means the mode itself knows it (e.g. reverse proxy targets),
+        `original_dst` asks the OS for the pre-redirect destination, and `stream`
+        reads it off a stream that mitmproxy_rs already resolved for us.
+        """
+        return "spec"
+
     def to_json(self) -> dict:
         return {
             "type": self.mode.type_name,
@@ -195,7 +207,7 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
             ctx.master, reader, writer, ctx.options, self.mode
         )
         handler.layer = self.make_top_layer(handler.layer.context)
-        if isinstance(self.mode, (mode_specs.TransparentMode, mode_specs.HotspotMode)):
+        if self.destination == "original_dst":
             assert isinstance(writer, asyncio.StreamWriter)
             s = cast(socket.socket, writer.get_extra_info("socket"))
             try:
@@ -208,9 +220,8 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
             else:
                 handler.layer.context.client.sockname = original_dst
                 handler.layer.context.server.address = original_dst
-        elif isinstance(
-            self.mode,
-            (mode_specs.WireGuardMode, mode_specs.LocalMode, mode_specs.TunMode),
+        elif (
+            self.destination == "stream"
         ):  # pragma: no cover on platforms without wg-test-client
             handler.layer.context.server.address = writer.get_extra_info(
                 "remote_endpoint", handler.layer.context.client.sockname
@@ -335,6 +346,7 @@ class AsyncioServerInstance(ServerInstance[M], metaclass=ABCMeta):
 
 
 class WireGuardServerInstance(AsyncioServerInstance[mode_specs.WireGuardMode]):
+    destination = "stream"
     server_key: str
     client_key: str
     pubkey: str
@@ -419,6 +431,7 @@ class WireGuardServerInstance(AsyncioServerInstance[mode_specs.WireGuardMode]):
 
 
 class LocalRedirectorInstance(ServerInstance[mode_specs.LocalMode]):
+    destination = "stream"
     _server: ClassVar[mitmproxy_rs.local.LocalRedirector | None] = None
     """The local redirector daemon. Will be started once and then reused for all future instances."""
     _instance: ClassVar[LocalRedirectorInstance | None] = None
@@ -482,6 +495,8 @@ class UpstreamInstance(AsyncioServerInstance[mode_specs.UpstreamMode]):
 
 
 class TransparentInstance(AsyncioServerInstance[mode_specs.TransparentMode]):
+    destination = "original_dst"
+
     def make_top_layer(self, context: Context) -> Layer:
         return layers.modes.TransparentProxy(context)
 
@@ -503,55 +518,106 @@ class DnsInstance(AsyncioServerInstance[mode_specs.DnsMode]):
 
 class HotspotInstance(AsyncioServerInstance[mode_specs.HotspotMode]):
     """
-    A transparent listener plus the Wi-Fi hotspot that feeds it.
+    A Wi-Fi hotspot plus whatever it takes to get its clients' traffic to us.
 
-    The listener is started first so that we know which port to redirect to,
-    which matters when the user asked for an ephemeral port.
+    Depending on the capture method that is either a tun interface, which handles
+    TCP and UDP alike, or a transparent TCP listener that the packet filter
+    redirects into. Either way the capture side is set up first, because the
+    hotspot's rules need to know the tun name or the actual listen port -- which
+    matters when the user asked for an ephemeral one.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._backend: hotspot.HotspotBackend | None = None
         self._status: hotspot.HotspotStatus | None = None
+        self._tun: mitmproxy_rs.tun.TunInterface | None = None
 
     def make_top_layer(self, context: Context) -> Layer:
         return layers.modes.TransparentProxy(context)
+
+    @property
+    def destination(self) -> Literal["spec", "original_dst", "stream"]:
+        # a tun interface knows the real destination, a redirected socket doesn't.
+        if self.mode.config.capture_method == "tun":
+            return "stream"
+        return "original_dst"
+
+    @property
+    def is_running(self) -> bool:
+        return self._tun is not None or super().is_running
 
     @property
     def status(self) -> hotspot.HotspotStatus | None:
         """The hotspot that is currently running, or `None`."""
         return self._status
 
+    @property
+    def tun_name(self) -> str | None:
+        """The tun interface carrying client traffic, if that is the capture method."""
+        return self._tun.tun_name() if self._tun else None
+
     def to_json(self) -> dict:
         return {
             "hotspot": self._status.to_json() if self._status else None,
+            "tun_name": self.tun_name,
             **super().to_json(),
         }
 
     async def _start(self) -> None:
-        await super()._start()
-        _, port, *_ = self.listen_addrs[0]
+        target = await self._start_capture()
         try:
-            backend = hotspot.create_backend(self.mode.config, port)
+            backend = hotspot.create_backend(self.mode.config, target)
             self._status = await backend.start()
         except Exception:
-            # don't leave the listener behind if there is no hotspot to feed it.
-            await super()._stop()
+            # don't leave a capture device behind if there is no hotspot to feed it.
+            await self._stop_capture()
             raise
         self._backend = backend
 
         status = self._status
         where = f" on {status.address}" if status.address else ""
         how = (
-            f"redirected via {status.redirector}"
+            f"captured via {status.capture} ({status.redirector})"
             if status.redirector
-            else "not redirected"
+            else "not captured"
         )
         logger.info(
             f"Hotspot {status.ssid!r} is up{where} "
             f"(backend: {status.backend}, interface: {status.interface}, traffic {how}). "
             f"Connect a device and install mitmproxy's certificate from http://mitm.it."
         )
+
+    async def _start_capture(self) -> hotspot.CaptureTarget:
+        """Create the device or listener that client traffic will be steered into."""
+        if self.mode.config.capture_method == "tun":
+            assert self._tun is None
+            try:
+                self._tun = await mitmproxy_rs.tun.create_tun_interface(
+                    self.handle_stream,
+                    self.handle_stream,
+                    tun_name=self.mode.config.tun_name,
+                )
+            except Exception as e:
+                raise hotspot.HotspotError(
+                    f"Failed to create the hotspot's tun interface: {e}\n"
+                    f"Creating one needs root privileges (or CAP_NET_ADMIN on the "
+                    f"Python interpreter). Alternatively, pass "
+                    f"`--mode hotspot:capture=redirect` for TCP-only interception."
+                ) from e
+            return hotspot.CaptureTarget(tun=self._tun.tun_name())
+        else:
+            await super()._start()
+            _, port, *_ = self.listen_addrs[0]
+            return hotspot.CaptureTarget(port=port)
+
+    async def _stop_capture(self) -> None:
+        if self._tun is not None:
+            tun, self._tun = self._tun, None
+            tun.close()
+            await tun.wait_closed()
+        elif self._servers:
+            await super()._stop()
 
     async def _stop(self) -> None:
         try:
@@ -560,10 +626,11 @@ class HotspotInstance(AsyncioServerInstance[mode_specs.HotspotMode]):
                 self._status = None
                 await backend.stop()
         finally:
-            await super()._stop()
+            await self._stop_capture()
 
 
 class TunInstance(ServerInstance[mode_specs.TunMode]):
+    destination = "stream"
     _server: mitmproxy_rs.tun.TunInterface | None = None
     listen_addrs = ()
 

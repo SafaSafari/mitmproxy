@@ -7,6 +7,7 @@ import transparentReducer from "./modes/transparent";
 import socksReducer from "./modes/socks";
 import upstreamReducer from "./modes/upstream";
 import dnsReducer from "./modes/dns";
+import hotspotReducer from "./modes/hotspot";
 
 const modes = combineReducers({
     regular: regularReducer,
@@ -17,6 +18,7 @@ const modes = combineReducers({
     socks: socksReducer,
     upstream: upstreamReducer,
     dns: dnsReducer,
+    hotspot: hotspotReducer,
     //add new modes here
 });
 

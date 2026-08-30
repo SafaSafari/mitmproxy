@@ -12,6 +12,9 @@
   Access points are created with NetworkManager or hostapd on Linux, Internet Sharing on macOS,
   and the Mobile Hotspot on Windows; traffic is redirected with nftables/iptables, pf, and WinDivert respectively.
   When mitmproxy itself is not root, the privileged commands are run through `sudo -n` (configurable with `sudo=`).
+  On Linux, client traffic is routed into a TUN interface by default (`capture=tun`), which captures UDP and therefore
+  QUIC/HTTP3 as well; `capture=redirect` selects the TCP-only packet filter redirect used on other platforms.
+  The mode can also be configured from mitmweb's Capture tab.
 - Replace deprecated pyparsing APIs with their snake_case equivalents to avoid
   `PyparsingDeprecationWarning` during command and flow-filter parsing.
   ([#8344](https://github.com/mitmproxy/mitmproxy/pull/8344), @Dnsayhey)

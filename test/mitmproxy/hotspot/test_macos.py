@@ -5,6 +5,7 @@ import pytest
 
 from .helpers import config
 from .helpers import FakeRunner
+from .helpers import target
 from mitmproxy.hotspot import macos
 from mitmproxy.hotspot.base import HotspotError
 
@@ -14,7 +15,7 @@ class TestInternetSharing:
         monkeypatch.setattr(macos, "NAT_PLIST", tmp_path / "com.apple.nat.plist")
         monkeypatch.setattr(macos, "which", lambda *a: True)
         monkeypatch.setattr(sys, "platform", "darwin")
-        return macos.InternetSharingBackend(config(**kwargs), 8080, runner)
+        return macos.InternetSharingBackend(config(**kwargs), target(), runner)
 
     def test_available(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -83,7 +84,9 @@ class TestInternetSharing:
 
 class TestPfRedirector:
     def test_ruleset(self):
-        r = macos.PfRedirector("bridge100", "192.168.2.1", 8080, runner=FakeRunner())
+        r = macos.PfRedirector(
+            "bridge100", "192.168.2.1", target(), runner=FakeRunner()
+        )
         rules = r.ruleset()
         assert "block drop in on bridge100 proto udp to port 443" in rules
         assert "no rdr on bridge100 proto tcp to 192.168.2.1" in rules
@@ -92,7 +95,7 @@ class TestPfRedirector:
 
     def test_minimal_ruleset(self):
         r = macos.PfRedirector(
-            "bridge100", None, 8080, block_quic=False, runner=FakeRunner()
+            "bridge100", None, target(), block_quic=False, runner=FakeRunner()
         )
         assert r.ruleset().count("\n") == 1
 
@@ -103,7 +106,7 @@ class TestPfRedirector:
 
     async def test_start_stop(self):
         runner = FakeRunner({"pfctl -E": "pf enabled\nToken : 12345678\n"})
-        r = macos.PfRedirector("bridge100", None, 8080, runner=runner)
+        r = macos.PfRedirector("bridge100", None, target(), runner=runner)
         await r.start()
         assert r.token == "12345678"
         await r.stop()
@@ -111,7 +114,7 @@ class TestPfRedirector:
         assert r.token is None
 
     async def test_start_without_token(self):
-        r = macos.PfRedirector("bridge100", None, 8080, runner=FakeRunner())
+        r = macos.PfRedirector("bridge100", None, target(), runner=FakeRunner())
         await r.start()
         assert r.token is None
         await r.stop()
@@ -122,7 +125,7 @@ class TestNatPlistWriting:
 
     def backend(self, runner, tmp_path, monkeypatch, **kwargs):
         monkeypatch.setattr(macos, "NAT_PLIST", tmp_path / "com.apple.nat.plist")
-        return macos.InternetSharingBackend(config(**kwargs), 8080, runner)
+        return macos.InternetSharingBackend(config(**kwargs), target(), runner)
 
     async def test_direct_write_as_root(self, tmp_path, monkeypatch):
         runner = FakeRunner()

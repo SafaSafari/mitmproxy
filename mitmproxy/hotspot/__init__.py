@@ -16,6 +16,8 @@ from mitmproxy.hotspot import macos as macos  # noqa: F401
 from mitmproxy.hotspot import manual as manual  # noqa: F401
 from mitmproxy.hotspot import windows as windows  # noqa: F401
 from mitmproxy.hotspot.base import BACKEND_NAMES
+from mitmproxy.hotspot.base import CAPTURE_METHODS
+from mitmproxy.hotspot.base import CaptureTarget
 from mitmproxy.hotspot.base import create_backend
 from mitmproxy.hotspot.base import create_redirector
 from mitmproxy.hotspot.base import HotspotBackend
@@ -26,6 +28,8 @@ from mitmproxy.hotspot.base import TrafficRedirector
 
 __all__ = [
     "BACKEND_NAMES",
+    "CAPTURE_METHODS",
+    "CaptureTarget",
     "HotspotBackend",
     "HotspotConfig",
     "HotspotError",

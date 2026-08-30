@@ -6,6 +6,7 @@ import { getSpec as getTransparentSpec } from "../../modes/transparent";
 import { getSpec as getSocksSpec } from "../../modes/socks";
 import { getSpec as getUpstreamSpec } from "../../modes/upstream";
 import { getSpec as getDnsSpec } from "../../modes/dns";
+import { getSpec as getHotspotSpec } from "../../modes/hotspot";
 import { fetchApi } from "../../utils";
 import type { BackendState } from "../backendState";
 import type {
@@ -37,6 +38,7 @@ export async function updateModes(_, thunkAPI) {
         ...modes.socks.filter(isActiveMode).map(getSocksSpec),
         ...modes.upstream.filter(isActiveMode).map(getUpstreamSpec),
         ...modes.dns.filter(isActiveMode).map(getDnsSpec),
+        ...modes.hotspot.filter(isActiveMode).map(getHotspotSpec),
         //add new modes here
     ];
     const response = await fetchApi.put("/options", {

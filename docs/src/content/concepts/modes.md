@@ -395,9 +395,11 @@ a games console, or an IoT gadget.
 
 Under the hood this combines two things that mitmproxy can otherwise only do
 separately: it creates the access point using the operating system's own tooling,
-and it then installs the packet filter rules that send client traffic into a
-[transparent](#transparent-proxy) listener. Both halves are torn down again when
-mitmproxy exits.
+and it then forces the clients' traffic into mitmproxy. Both halves are torn down
+again when mitmproxy exits.
+
+How the traffic is captured makes a real difference to what you get to see, see
+[Capture methods](#capture-methods) below.
 
 Clients still need to trust mitmproxy's certificate. Connect a device to the new
 network and open [mitm.it](http://mitm.it) as usual.
@@ -420,10 +422,34 @@ A bare value is taken as the network name, so `--mode hotspot:my-network` works 
 | `share` | default route | The uplink interface that provides internet access. |
 | `gateway` | backend default | The address clients use as their gateway. Mostly useful with `backend=manual`. |
 | `band` | `bg` | `bg` for 2.4 GHz or `a` for 5 GHz. |
+| `capture` | `auto` | How traffic reaches mitmproxy, see [Capture methods](#capture-methods). |
+| `tun` | `tun0` | A fixed name for the tun interface, with `capture=tun`. |
 | `backend` | autodetected | Force a specific backend, see below. |
 | `sudo` | `auto` | When to run privileged commands through `sudo`. See [Privileges](#privileges). |
-| `quic` | `block` | `allow` lets clients speak QUIC. See [QUIC](#quic) below. |
+| `quic` | capture-dependent | `block` or `allow`. See [Capture methods](#capture-methods). |
 | `redirect` | `on` | `off` creates the access point but does not intercept its traffic. |
+
+### Capture methods
+
+There are two ways to get a client's packets into mitmproxy, and `capture=auto`
+picks the better one that your platform supports.
+
+**`capture=tun`** routes traffic into a virtual network device that mitmproxy
+terminates itself. Because mitmproxy sees whole IP packets, the original
+destination comes straight out of the IP header -- which means **UDP works**, and
+with it QUIC and HTTP/3. This is the default wherever it is available, which
+today means Linux.
+
+**`capture=redirect`** rewrites the destination of TCP connections with the
+system's packet filter so that they land in a [transparent](#transparent-proxy)
+listener. mitmproxy then recovers the real destination from the OS. This works on
+Linux, macOS, and Windows, but the mechanism it relies on is **TCP-only**.
+
+Because a redirect-captured hotspot cannot see UDP, a browser speaking HTTP/3
+would sail straight past mitmproxy. To prevent that, `capture=redirect` drops
+UDP port 443 from clients by default, which makes browsers fall back to TCP.
+`capture=tun` has no such problem and leaves QUIC alone. Either way you can
+override the behaviour with `quic=block` or `quic=allow`.
 
 ### Backends
 
@@ -437,8 +463,9 @@ mitmproxy picks the first backend that works on your machine:
 | `winhotspot` | Windows | Uses the Windows Mobile Hotspot, falling back to the legacy hosted network. |
 | `manual` | any | Does not create anything, see below. |
 
-Traffic is redirected with nftables or iptables on Linux, with `pf` on macOS, and
-with WinDivert on Windows.
+With `capture=tun`, traffic is routed into the tun interface with `iproute2`
+policy routing. With `capture=redirect`, it is redirected with nftables or
+iptables on Linux, `pf` on macOS, and WinDivert on Windows.
 
 #### Using an existing access point
 
@@ -453,13 +480,6 @@ sudo mitmdump --mode hotspot:backend=manual,iface=bridge100,gateway=192.168.2.1
 This is also the fallback on recent macOS versions, which require Internet Sharing
 to be enabled once through *System Settings > General > Sharing*.
 
-### QUIC
-
-mitmproxy's transparent listener only handles TCP, so a browser speaking HTTP/3
-would sail straight past it. By default, hotspot mode therefore drops UDP port 443
-from clients, which makes browsers fall back to TCP. Pass `quic=allow` to keep
-QUIC working -- that traffic will then not be intercepted.
-
 ### Privileges
 
 Creating the access point and redirecting traffic need different kinds of
@@ -467,8 +487,9 @@ permission, which is worth knowing when mitmproxy is not running as root:
 
 - Creating the access point often works unprivileged. `nmcli`, for example, asks
   polkit, which is why a desktop password prompt is usually enough.
-- Installing the packet filter rules does *not* go through polkit. When mitmproxy
-  is not root, it runs `nft`, `iptables`, and `pfctl` through `sudo -n` instead.
+- Setting up the routing or packet filter rules does *not* go through polkit. When
+  mitmproxy is not root, it runs `ip`, `nft`, `iptables`, and `pfctl` through
+  `sudo -n` instead.
 
 `sudo -n` never prompts, so the user mitmproxy runs as needs a passwordless
 sudoers rule. For a dedicated `mitm` user on Linux that is:
@@ -492,7 +513,10 @@ sudo mitmdump --mode hotspot:ssid=my-network,password=hunter22
   privileges on Windows -- either directly or through `sudo`, see above.
 - Your wireless adapter must be able to act as an access point. On Linux you can
   check with `iw list | grep -A 10 "Supported interface modes"`, which should list `AP`.
-- On Windows, the redirector always uses port 8080, so keep the default listen port.
+- `capture=tun` is Linux-only for now; elsewhere `capture=auto` falls back to
+  `capture=redirect`.
+- With `capture=redirect` on Windows, the redirector always uses port 8080, so
+  keep the default listen port.
 - The access point runs on the interface it is hosted on, so on a machine with a
   single Wi-Fi adapter you need a second connection (Ethernet, USB tethering) as
   the uplink.

@@ -4,6 +4,7 @@ import pytest
 
 from .helpers import config
 from .helpers import FakeRunner
+from .helpers import target
 from mitmproxy import hotspot
 from mitmproxy.hotspot import linux
 from mitmproxy.hotspot import manual
@@ -16,7 +17,7 @@ class TestManual:
         monkeypatch.setattr(linux, "which", lambda *a: True)
         runner = FakeRunner()
         b = manual.ManualBackend(
-            config(interface="bridge100", gateway="192.168.2.1"), 8080, runner
+            config(interface="bridge100", gateway="192.168.2.1"), target(), runner
         )
         status = await b.start()
         assert status.backend == "manual"
@@ -29,4 +30,4 @@ class TestManual:
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(linux, "which", lambda *a: False)
         with pytest.raises(HotspotError, match="No usable hotspot backend"):
-            hotspot.create_backend(config(interface="wlan0"), 8080)
+            hotspot.create_backend(config(interface="wlan0"), target())

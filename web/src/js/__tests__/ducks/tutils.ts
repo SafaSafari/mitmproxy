@@ -191,6 +191,12 @@ export const testState: RootState = {
                 ui_id: 8,
             },
         ],
+        hotspot: [
+            {
+                active: false,
+                ui_id: 9,
+            },
+        ],
     },
     processes: {
         currentProcesses: [

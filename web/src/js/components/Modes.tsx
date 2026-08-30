@@ -8,6 +8,7 @@ import Transparent from "./Modes/Transparent";
 import Socks from "./Modes/Socks";
 import Upstream from "./Modes/Upstream";
 import Dns from "./Modes/Dns";
+import Hotspot from "./Modes/Hotspot";
 import MissingMode from "./Modes/MissingMode";
 
 export default function Modes() {
@@ -33,6 +34,7 @@ export default function Modes() {
                         <Local />
                     )}
                     <Wireguard />
+                    <Hotspot />
                     <Reverse />
                 </div>
             </div>

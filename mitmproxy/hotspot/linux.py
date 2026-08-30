@@ -8,7 +8,13 @@ Two backends are available:
  - `hostapd` is the fallback for machines without NetworkManager. It runs
    `hostapd` and `dnsmasq` directly and configures addressing and NAT by hand.
 
-Traffic is redirected with nftables if available and with iptables otherwise.
+Client traffic reaches mitmproxy in one of two ways:
+
+ - `iproute2` sends it into mitmproxy's tun interface using policy routing.
+   mitmproxy terminates the interface itself, which is what makes UDP (and
+   therefore QUIC) interceptable. This is the default.
+ - `nftables` / `iptables` rewrite the destination of TCP connections so that
+   they land in a transparent listener. Simpler, but TCP-only.
 """
 
 from __future__ import annotations
@@ -37,6 +43,11 @@ TABLE_NAME = "mitmproxy_hotspot"
 HOSTAPD_GATEWAY = "10.42.42.1"
 HOSTAPD_PREFIX = 24
 HOSTAPD_DHCP_RANGE = ("10.42.42.10", "10.42.42.250")
+
+ROUTE_TABLE = "8420"
+"""The routing table that holds the default route into mitmproxy's tun interface."""
+ROUTE_PRIORITY = "8420"
+"""The `ip rule` priority that sends client traffic to `ROUTE_TABLE`."""
 
 
 def wireless_interfaces() -> list[str]:
@@ -370,6 +381,94 @@ class HostapdBackend(_LinuxBackend):
                 check=False,
             )
             self.interface = None
+
+
+class TunRouter(TrafficRedirector):
+    """
+    Routes hotspot clients into mitmproxy's tun interface with policy routing.
+
+    A single `ip rule` matching on the access point's interface is enough: it only
+    ever sees *forwarded* packets, because anything addressed at the machine
+    itself -- DHCP, DNS, `mitm.it` -- is resolved by the kernel's `local` table
+    first, which sits at rule priority 0 and therefore wins.
+    """
+
+    name = "iproute2"
+    capture = "tun"
+    platforms = ("linux",)
+
+    @classmethod
+    def available(cls) -> bool:
+        return cls.supported() and which("ip", "sysctl")
+
+    async def start(self) -> None:
+        tun = self.target.tun
+        assert tun
+        await self.stop()  # `ip rule add` stacks, so start from a clean slate
+
+        await self.run("sysctl", "-w", "net.ipv4.ip_forward=1")
+        await self.run("ip", "link", "set", "dev", tun, "up")
+        await self.run(
+            "ip", "route", "add", "default", "dev", tun, "table", ROUTE_TABLE
+        )
+        await self.run(
+            "ip",
+            "rule",
+            "add",
+            "iif",
+            self.interface,
+            "lookup",
+            ROUTE_TABLE,
+            "priority",
+            ROUTE_PRIORITY,
+        )
+
+        try:
+            await self.run("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
+            await self.run(
+                "ip",
+                "-6",
+                "route",
+                "add",
+                "default",
+                "dev",
+                tun,
+                "table",
+                ROUTE_TABLE,
+            )
+            await self.run(
+                "ip",
+                "-6",
+                "rule",
+                "add",
+                "iif",
+                self.interface,
+                "lookup",
+                ROUTE_TABLE,
+                "priority",
+                ROUTE_PRIORITY,
+            )
+        except HotspotError as e:  # pragma: no cover
+            logger.debug(f"Not routing IPv6 hotspot traffic into {tun}: {e}")
+
+    async def stop(self) -> None:
+        for family in ([], ["-6"]):
+            await self.run(
+                "ip",
+                *family,
+                "rule",
+                "del",
+                "iif",
+                self.interface,
+                "lookup",
+                ROUTE_TABLE,
+                "priority",
+                ROUTE_PRIORITY,
+                check=False,
+            )
+            await self.run(
+                "ip", *family, "route", "flush", "table", ROUTE_TABLE, check=False
+            )
 
 
 class NftablesRedirector(TrafficRedirector):

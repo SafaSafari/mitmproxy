@@ -8,6 +8,16 @@ import { createAction, createSlice } from "@reduxjs/toolkit";
 export const STATE_RECEIVE = createAction<BackendState>("STATE_RECEIVE");
 export const STATE_UPDATE = createAction<Partial<BackendState>>("STATE_UPDATE");
 
+export interface HotspotInfo {
+    backend: string;
+    ssid: string;
+    password: string | null;
+    interface: string;
+    address: string | null;
+    capture: string;
+    redirector: string | null;
+}
+
 export interface ServerInfo {
     description: string;
     full_spec: string;
@@ -17,6 +27,7 @@ export interface ServerInfo {
     type: string;
     wireguard_conf?: string;
     tun_name?: string;
+    hotspot?: HotspotInfo | null;
 }
 
 export interface BackendState {

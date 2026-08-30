@@ -456,9 +456,7 @@ async def test_tun_mode(monkeypatch, caplog):
         await inst.stop()
 
 
-async def test_hotspot_mode(monkeypatch, caplog_async):
-    """The hotspot instance binds first, then hands the real port to the backend."""
-    caplog_async.set_level("INFO")
+def _hotspot_backend(**kwargs) -> Mock:
     backend = Mock()
     backend.start = AsyncMock(
         return_value=hotspot.HotspotStatus(
@@ -467,29 +465,77 @@ async def test_hotspot_mode(monkeypatch, caplog_async):
             password="hunter22",
             interface="wlan0",
             address="10.42.0.1",
-            redirector="nftables",
+            **kwargs,
         )
     )
     backend.stop = AsyncMock()
+    return backend
+
+
+async def test_hotspot_mode_redirect(monkeypatch, caplog_async):
+    """With redirect capture, the listener binds first so we know the real port."""
+    caplog_async.set_level("INFO")
+    backend = _hotspot_backend(capture="redirect", redirector="nftables")
     create_backend = Mock(return_value=backend)
     monkeypatch.setattr(hotspot, "create_backend", create_backend)
 
     with taddons.context(Proxyserver()):
-        inst = ServerInstance.make("hotspot:my-network@127.0.0.1:0", MagicMock())
+        inst = ServerInstance.make(
+            "hotspot:ssid=my-network,capture=redirect@127.0.0.1:0", MagicMock()
+        )
+        assert inst.destination == "original_dst"
         await inst.start()
         assert inst.is_running
         assert await caplog_async.await_log("Hotspot 'my-network' is up on 10.42.0.1")
 
-        config, port = create_backend.call_args[0]
+        config, target = create_backend.call_args[0]
         assert config.ssid == "my-network"
-        assert port == inst.listen_addrs[0][1] != 0
+        assert target.kind == "redirect"
+        assert target.port == inst.listen_addrs[0][1] != 0
 
         assert inst.status is not None
         assert inst.to_json()["hotspot"]["redirector"] == "nftables"
+        assert inst.tun_name is None
 
         await inst.stop()
         backend.stop.assert_awaited_once()
         assert inst.status is None
+        assert not inst.is_running
+
+
+async def test_hotspot_mode_tun(monkeypatch, caplog_async):
+    """With tun capture, the interface is created and its name drives the routing."""
+    caplog_async.set_level("INFO")
+    tun_interface = Mock()
+    tun_interface.tun_name = lambda: "tun0"
+    tun_interface.wait_closed = AsyncMock()
+    create_tun_interface = AsyncMock(return_value=tun_interface)
+    monkeypatch.setattr(mitmproxy_rs.tun, "create_tun_interface", create_tun_interface)
+
+    backend = _hotspot_backend(capture="tun", redirector="iproute2")
+    create_backend = Mock(return_value=backend)
+    monkeypatch.setattr(hotspot, "create_backend", create_backend)
+
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot:ssid=my-network,capture=tun", MagicMock())
+        # a tun interface resolves destinations itself, no SO_ORIGINAL_DST needed.
+        assert inst.destination == "stream"
+        assert inst.mode.transport_protocol == "both"
+        assert inst.mode.listen_port() is None
+
+        await inst.start()
+        assert inst.is_running
+        assert inst.tun_name == "tun0"
+        assert inst.listen_addrs == ()
+        assert await caplog_async.await_log("captured via tun (iproute2)")
+
+        _, target = create_backend.call_args[0]
+        assert target.kind == "tun"
+        assert target.tun == "tun0"
+        assert inst.to_json()["tun_name"] == "tun0"
+
+        await inst.stop()
+        tun_interface.close.assert_called_once()
         assert not inst.is_running
 
 
@@ -501,11 +547,34 @@ async def test_hotspot_mode_failure(monkeypatch):
         Mock(side_effect=hotspot.HotspotError("no wifi card")),
     )
     with taddons.context(Proxyserver()):
-        inst = ServerInstance.make("hotspot@127.0.0.1:0", MagicMock())
+        inst = ServerInstance.make("hotspot:capture=redirect@127.0.0.1:0", MagicMock())
         with pytest.raises(hotspot.HotspotError, match="no wifi card"):
             await inst.start()
         assert not inst.is_running
         assert inst.listen_addrs == ()
+
+
+async def test_hotspot_mode_tun_failure(monkeypatch):
+    """...and neither must it leave a tun interface behind."""
+    tun_interface = Mock()
+    tun_interface.tun_name = lambda: "tun0"
+    tun_interface.wait_closed = AsyncMock()
+    monkeypatch.setattr(
+        mitmproxy_rs.tun,
+        "create_tun_interface",
+        AsyncMock(return_value=tun_interface),
+    )
+    monkeypatch.setattr(
+        hotspot,
+        "create_backend",
+        Mock(side_effect=hotspot.HotspotError("no wifi card")),
+    )
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot:capture=tun", MagicMock())
+        with pytest.raises(hotspot.HotspotError, match="no wifi card"):
+            await inst.start()
+        assert not inst.is_running
+        tun_interface.close.assert_called_once()
 
 
 async def test_tun_mode_mocked(monkeypatch):
@@ -603,3 +672,18 @@ async def test_always_uses_current_instance(patched_local_redirector, monkeypatc
         monkeypatch.setattr(inst2, "handle_stream", handler := AsyncMock())
         await handle_stream(Mock())
         assert handler.await_count
+
+
+async def test_hotspot_mode_tun_unavailable(monkeypatch):
+    """Creating a tun interface needs privileges; say so instead of leaking the raw error."""
+    monkeypatch.setattr(
+        mitmproxy_rs.tun,
+        "create_tun_interface",
+        AsyncMock(side_effect=RuntimeError("Failed to create TUN device")),
+    )
+    with taddons.context(Proxyserver()):
+        inst = ServerInstance.make("hotspot:capture=tun", MagicMock())
+        with pytest.raises(hotspot.HotspotError, match="capture=redirect") as e:
+            await inst.start()
+        assert "Failed to create TUN device" in str(e.value)
+        assert not inst.is_running

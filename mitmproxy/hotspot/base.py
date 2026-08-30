@@ -11,7 +11,8 @@ A hotspot consists of two independent halves:
     addresses to clients. This is the part that differs wildly between
     operating systems.
  2. A *redirector* (`TrafficRedirector`) that forces the traffic of every
-    connected client through mitmproxy's transparent proxy listener.
+    connected client into mitmproxy, either by routing it into a tun interface
+    or by bending it into a transparent listener with the packet filter.
 
 Both halves are pluggable so that users can, for example, keep an access point
 that they created themselves and only let mitmproxy install the redirection
@@ -42,9 +43,27 @@ DEFAULT_PASSWORD = "mitmproxy"
 BACKEND_NAMES = ("nmcli", "hostapd", "internetsharing", "winhotspot", "manual")
 """All backend names that `HotspotConfig` accepts for `backend=`."""
 
+CAPTURE_METHODS = ("auto", "tun", "redirect")
+"""All values that `HotspotConfig` accepts for `capture=`."""
+
 
 class HotspotError(Exception):
     """Raised when a hotspot cannot be created, configured, or torn down."""
+
+
+@dataclass(frozen=True)
+class CaptureTarget:
+    """Where hotspot traffic has to end up for mitmproxy to see it."""
+
+    port: int | None = None
+    """The transparent listener's port, when traffic is redirected to it."""
+    tun: str | None = None
+    """The tun interface's name, when traffic is routed into it."""
+
+    @property
+    def kind(self) -> str:
+        """`tun` or `redirect`, matching `TrafficRedirector.capture`."""
+        return "tun" if self.tun else "redirect"
 
 
 CommandRunner = Callable[..., Awaitable[str]]
@@ -193,6 +212,16 @@ class HotspotConfig:
     """
     band: str | None = None
     """`bg` for 2.4 GHz or `a` for 5 GHz. Backend default if unset."""
+    capture: str = "auto"
+    """
+    How client traffic reaches mitmproxy, see `capture_method`.
+
+    `tun` routes it into a virtual network device that mitmproxy terminates
+    itself, `redirect` bends it into a transparent listener with the system's
+    packet filter, and `auto` picks the best one available.
+    """
+    tun_name: str | None = None
+    """A fixed name for the tun interface. Kernel default (`tun0`, ...) if unset."""
     backend: str | None = None
     """Force a specific backend instead of picking the best available one."""
     sudo: str = "auto"
@@ -204,12 +233,11 @@ class HotspotConfig:
     """
     redirect: bool = True
     """Install the rules that force client traffic through mitmproxy."""
-    block_quic: bool = True
+    block_quic: bool | None = None
     """
-    Drop QUIC from clients so that browsers fall back to TCP.
+    Drop QUIC from clients, or `None` to decide from the capture method.
 
-    mitmproxy's transparent listener is TCP-only, so without this a browser would
-    happily talk HTTP/3 straight past us.
+    See `drop_quic`.
     """
 
     _ALIASES: ClassVar[dict[str, str]] = {
@@ -223,6 +251,8 @@ class HotspotConfig:
         "gateway": "gateway",
         "gw": "gateway",
         "band": "band",
+        "capture": "capture",
+        "tun": "tun_name",
         "backend": "backend",
         "sudo": "sudo",
         "redirect": "redirect",
@@ -278,6 +308,31 @@ class HotspotConfig:
                 values[attr] = value.strip() or None
         return cls(**values).validated()
 
+    @property
+    def capture_method(self) -> str:
+        """
+        The capture method that will actually be used: `tun` or `redirect`.
+
+        `redirect=off` implies `redirect`, because a transparent listener on a
+        known port is the only thing left that clients can be pointed at by hand.
+        """
+        if not self.redirect:
+            return "redirect"
+        return resolve_capture(self.capture)
+
+    @property
+    def drop_quic(self) -> bool:
+        """
+        Whether clients should be stopped from speaking QUIC.
+
+        Redirected traffic is TCP-only, so a browser would otherwise talk HTTP/3
+        straight past us; dropping UDP/443 makes it fall back to TCP. A tun
+        interface sees UDP just fine, so there is nothing to protect against.
+        """
+        if self.block_quic is None:
+            return self.capture_method == "redirect"
+        return self.block_quic
+
     def validated(self) -> HotspotConfig:
         """Return self after checking that all values make sense. Raises `ValueError`."""
         if not self.ssid or len(self.ssid.encode()) > 32:
@@ -288,6 +343,8 @@ class HotspotConfig:
             )
         if self.band is not None and self.band not in ("bg", "a"):
             raise ValueError("band must be either 'bg' (2.4 GHz) or 'a' (5 GHz)")
+        if self.capture not in CAPTURE_METHODS:
+            raise ValueError(f"capture must be one of {', '.join(CAPTURE_METHODS)}")
         if self.sudo not in SUDO_MODES:
             raise ValueError(f"sudo must be one of {', '.join(SUDO_MODES)}")
         if self.backend is not None and self.backend not in BACKEND_NAMES:
@@ -330,6 +387,8 @@ class HotspotStatus:
     """The interface the access point runs on."""
     address: str | None = None
     """The gateway address that clients use, if known."""
+    capture: str = "redirect"
+    """How client traffic reaches mitmproxy: `tun` or `redirect`."""
     redirector: str | None = None
     """The name of the active redirector, or `None` if traffic is not redirected."""
 
@@ -340,6 +399,7 @@ class HotspotStatus:
             "password": self.password,
             "interface": self.interface,
             "address": self.address,
+            "capture": self.capture,
             "redirector": self.redirector,
         }
 
@@ -378,11 +438,11 @@ class HotspotBackend(_Registry, metaclass=ABCMeta):
     def __init__(
         self,
         config: HotspotConfig,
-        redirect_port: int,
+        target: CaptureTarget,
         runner: CommandRunner = run,
     ) -> None:
         self.config = config
-        self.redirect_port = redirect_port
+        self.target = target
         self.run = runner
         """Runs commands as ourselves. Use it for queries and for polkit-aware tools."""
         self.run_elevated = elevate(runner, config.sudo)
@@ -409,17 +469,19 @@ class HotspotBackend(_Registry, metaclass=ABCMeta):
 
     async def start_redirector(self, status: HotspotStatus) -> None:
         """Start the platform's redirector for `status` and record it on `status`."""
+        status.capture = self.target.kind
         if not self.config.redirect:
+            where = f"{status.address or 'this machine'}:{self.target.port}"
             logger.warning(
                 f"Hotspot {status.ssid!r} is running without traffic redirection. "
-                f"Configure clients to use {status.address or 'this machine'}:{self.redirect_port} as an HTTP proxy."
+                f"Configure clients to use {where} as an HTTP proxy."
             )
             return
         self.redirector = create_redirector(
             interface=status.interface,
             gateway=status.address,
-            port=self.redirect_port,
-            block_quic=self.config.block_quic,
+            target=self.target,
+            block_quic=self.config.drop_quic,
             # packet filter rules are not something polkit hands out, so these
             # commands go through sudo when mitmproxy itself is unprivileged.
             runner=self.run_elevated,
@@ -448,23 +510,31 @@ class HotspotBackend(_Registry, metaclass=ABCMeta):
 
 
 class TrafficRedirector(_Registry, metaclass=ABCMeta):
-    """Forces the traffic of hotspot clients into mitmproxy's transparent listener."""
+    """Forces the traffic of hotspot clients into mitmproxy."""
 
     _registry: ClassVar[dict[str, Any]] = {}
+
+    capture: ClassVar[str] = "redirect"
+    """The kind of `CaptureTarget` this implementation can aim traffic at."""
 
     def __init__(
         self,
         interface: str,
         gateway: str | None,
-        port: int,
+        target: CaptureTarget,
         block_quic: bool = True,
         runner: CommandRunner = run,
     ) -> None:
         self.interface = interface
         self.gateway = gateway
-        self.port = port
+        self.target = target
         self.block_quic = block_quic
         self.run = runner
+
+    @property
+    def port(self) -> int | None:
+        """The transparent listener's port, for redirect-style implementations."""
+        return self.target.port
 
     @abstractmethod
     async def start(self) -> None:
@@ -475,9 +545,26 @@ class TrafficRedirector(_Registry, metaclass=ABCMeta):
         """Remove the redirection rules again. Must not raise."""
 
 
+def resolve_capture(method: str = "auto") -> str:
+    """
+    Resolve `capture=auto` to the best capture method available here.
+
+    A tun interface is preferred because mitmproxy terminates it itself and reads
+    the original destination straight from the IP header, which is what makes UDP
+    -- and therefore QUIC -- interceptable. It is Linux-only for now, so elsewhere
+    we fall back to the TCP-only packet filter redirect.
+    """
+    if method != "auto":
+        return method
+    for cls in TrafficRedirector._registry.values():
+        if cls.capture == "tun" and cls.available():
+            return "tun"
+    return "redirect"
+
+
 def create_backend(
     config: HotspotConfig,
-    redirect_port: int,
+    target: CaptureTarget,
     runner: CommandRunner = run,
 ) -> HotspotBackend:
     """
@@ -494,13 +581,13 @@ def create_backend(
                     raise HotspotError(
                         f"The {cls.name} hotspot backend is not available on this machine."
                     )
-                return cls(config, redirect_port, runner)
+                return cls(config, target, runner)
         raise HotspotError(f"Unknown hotspot backend: {config.backend}")
 
     for cls in candidates:
         # the manual backend never wins by default, it needs an existing access point.
         if cls.name != "manual" and cls.available():
-            return cls(config, redirect_port, runner)
+            return cls(config, target, runner)
 
     supported = sorted(c.name for c in candidates if c.supported())
     raise HotspotError(
@@ -513,22 +600,25 @@ def create_backend(
 def create_redirector(
     interface: str,
     gateway: str | None,
-    port: int,
+    target: CaptureTarget,
     block_quic: bool = True,
     runner: CommandRunner = run,
 ) -> TrafficRedirector:
     """
-    Pick the best available redirector for the current platform.
+    Pick the best available redirector for `target` on the current platform.
 
-    Raises `HotspotError` if traffic cannot be redirected here.
+    Raises `HotspotError` if traffic cannot be sent to `target` here.
     """
     candidates: list[type[TrafficRedirector]] = list(
         TrafficRedirector._registry.values()
     )
     for cls in candidates:
-        if cls.available():
-            return cls(interface, gateway, port, block_quic, runner)
+        if cls.capture == target.kind and cls.available():
+            return cls(interface, gateway, target, block_quic, runner)
+    alternative = "redirect" if target.kind == "tun" else "tun"
     raise HotspotError(
-        f"Cannot redirect hotspot traffic on this platform ({sys.platform}). "
-        f"Use `--mode hotspot:redirect=off` to run the access point without interception."
+        f"Cannot send hotspot traffic to mitmproxy on this platform ({sys.platform}) "
+        f"using the {target.kind!r} capture method. "
+        f"Try `--mode hotspot:capture={alternative}`, or `--mode hotspot:redirect=off` "
+        f"to run the access point without interception."
     )

@@ -4,6 +4,7 @@ import pytest
 
 from .helpers import config
 from .helpers import FakeRunner
+from .helpers import target
 from mitmproxy import hotspot
 from mitmproxy.hotspot import base
 from mitmproxy.hotspot import linux
@@ -98,6 +99,7 @@ class TestConfig:
             ("password=short", "8 and 63"),
             ("ssid=" + "x" * 33, "1 and 32 bytes"),
             ("band=ac", "bg"),
+            ("capture=magic", "capture must be one of"),
             ("sudo=maybe", "sudo must be one of"),
             ("backend=carrier-pigeon", "unknown backend"),
             ("backend=manual", "requires an interface"),
@@ -118,48 +120,50 @@ class TestRegistry:
     def test_explicit_backend(self, monkeypatch):
         monkeypatch.setattr(linux, "which", lambda *a: True)
         monkeypatch.setattr(sys, "platform", "linux")
-        b = hotspot.create_backend(config(backend="nmcli"), 8080)
+        b = hotspot.create_backend(config(backend="nmcli"), target())
         assert isinstance(b, linux.NetworkManagerBackend)
 
     def test_explicit_backend_unavailable(self, monkeypatch):
         monkeypatch.setattr(linux, "which", lambda *a: False)
         with pytest.raises(HotspotError, match="not available"):
-            hotspot.create_backend(config(backend="nmcli"), 8080)
+            hotspot.create_backend(config(backend="nmcli"), target())
 
     def test_unknown_backend(self):
         # HotspotConfig rejects these, but the registry guards against it as well.
         with pytest.raises(HotspotError, match="Unknown hotspot backend"):
-            hotspot.create_backend(HotspotConfig(backend="nope"), 8080)
+            hotspot.create_backend(HotspotConfig(backend="nope"), target())
 
     def test_autodetect_prefers_nmcli(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(linux, "which", lambda *a: True)
         assert isinstance(
-            hotspot.create_backend(config(), 8080), linux.NetworkManagerBackend
+            hotspot.create_backend(config(), target()), linux.NetworkManagerBackend
         )
 
     def test_autodetect_falls_back_to_hostapd(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(linux, "which", lambda *a: "nmcli" not in a)
-        assert isinstance(hotspot.create_backend(config(), 8080), linux.HostapdBackend)
+        assert isinstance(
+            hotspot.create_backend(config(), target()), linux.HostapdBackend
+        )
 
     def test_autodetect_nothing_available(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(linux, "which", lambda *a: False)
         with pytest.raises(HotspotError, match="No usable hotspot backend"):
-            hotspot.create_backend(config(), 8080)
+            hotspot.create_backend(config(), target())
 
     def test_redirector_autodetect(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(linux, "which", lambda *a: "nft" not in a)
         assert isinstance(
-            hotspot.create_redirector("wlan0", None, 8080), linux.IptablesRedirector
+            hotspot.create_redirector("wlan0", None, target()), linux.IptablesRedirector
         )
 
     def test_no_redirector(self, monkeypatch):
         monkeypatch.setattr(base.TrafficRedirector, "_registry", {})
-        with pytest.raises(HotspotError, match="Cannot redirect hotspot traffic"):
-            hotspot.create_redirector("wlan0", None, 8080)
+        with pytest.raises(HotspotError, match="Cannot send hotspot traffic"):
+            hotspot.create_redirector("wlan0", None, target())
 
 
 @pytest.fixture
@@ -211,7 +215,7 @@ class TestBackendLifecycle:
 
     async def test_redirector_is_wired_up(self, fake_stack):
         backend_cls, redirector_cls, log = fake_stack
-        b = backend_cls(config(ssid="net"), 8080, FakeRunner())
+        b = backend_cls(config(ssid="net"), target(), FakeRunner())
 
         status = await b.start()
         assert status.redirector == "fake-redirector"
@@ -222,6 +226,7 @@ class TestBackendLifecycle:
             "password": "mitmproxy",
             "interface": "wlan0",
             "address": "10.0.0.1",
+            "capture": "redirect",
             "redirector": "fake-redirector",
         }
 
@@ -233,7 +238,7 @@ class TestBackendLifecycle:
 
     async def test_redirect_disabled(self, fake_stack, caplog):
         backend_cls, redirector_cls, log = fake_stack
-        b = backend_cls(config(redirect=False), 8080, FakeRunner())
+        b = backend_cls(config(redirect=False), target(), FakeRunner())
         status = await b.start()
         assert status.redirector is None
         assert log == []
@@ -246,7 +251,7 @@ class TestBackendLifecycle:
             raise HotspotError("nft: Operation not permitted")
 
         monkeypatch.setattr(redirector_cls, "start", boom)
-        b = backend_cls(config(), 8080, FakeRunner())
+        b = backend_cls(config(), target(), FakeRunner())
         with pytest.raises(HotspotError, match="requires root") as e:
             await b.start()
         assert "Operation not permitted" in str(e.value)
@@ -308,7 +313,7 @@ class TestElevate:
 
     async def test_redirector_gets_the_elevated_runner(self, fake_stack):
         backend_cls, _, log = fake_stack
-        b = backend_cls(config(sudo="always"), 8080, FakeRunner())
+        b = backend_cls(config(sudo="always"), target(), FakeRunner())
         assert b.run_elevated is not b.run
         await b.start()
         assert log  # redirector ran, and it ran through the elevated runner
@@ -320,7 +325,73 @@ class TestElevate:
             raise HotspotError("`nft` needs root privileges, add a NOPASSWD rule")
 
         monkeypatch.setattr(redirector_cls, "start", boom)
-        b = backend_cls(config(), 8080, FakeRunner())
+        b = backend_cls(config(), target(), FakeRunner())
         with pytest.raises(HotspotError) as e:
             await b.start()
         assert str(e.value).count("root privileges") == 1
+
+
+class TestCaptureMethod:
+    def test_target_kind(self):
+        assert base.CaptureTarget(port=8080).kind == "redirect"
+        assert base.CaptureTarget(tun="tun0").kind == "tun"
+
+    def test_resolve_explicit(self):
+        assert base.resolve_capture("tun") == "tun"
+        assert base.resolve_capture("redirect") == "redirect"
+
+    def test_resolve_auto_prefers_tun(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        assert base.resolve_capture("auto") == "tun"
+
+    def test_resolve_auto_falls_back(self, monkeypatch):
+        # no tun router registered, e.g. on macOS and Windows.
+        monkeypatch.setattr(
+            base.TrafficRedirector,
+            "_registry",
+            {
+                k: v
+                for k, v in base.TrafficRedirector._registry.items()
+                if k != "iproute2"
+            },
+        )
+        assert base.resolve_capture("auto") == "redirect"
+
+    def test_config_capture_method(self, monkeypatch):
+        monkeypatch.setattr(base, "resolve_capture", lambda m: "tun")
+        assert HotspotConfig().capture_method == "tun"
+        # an explicit proxy is the only thing left to point clients at.
+        assert HotspotConfig(redirect=False).capture_method == "redirect"
+
+    @pytest.mark.parametrize(
+        "capture,block_quic,expected",
+        [
+            ("redirect", None, True),  # TCP-only capture: QUIC would slip past
+            ("tun", None, False),  # tun sees UDP, no need to block anything
+            ("tun", True, True),  # explicit wins
+            ("redirect", False, False),
+        ],
+    )
+    def test_drop_quic(self, capture, block_quic, expected):
+        c = HotspotConfig(capture=capture, block_quic=block_quic)
+        assert c.drop_quic is expected
+
+    def test_tun_name(self):
+        assert HotspotConfig.parse("tun=mitm0").tun_name == "mitm0"
+
+    async def test_redirector_matches_target_kind(self, monkeypatch):
+        """A tun target must not be handed to a packet filter redirector."""
+        monkeypatch.setattr(
+            base.TrafficRedirector,
+            "_registry",
+            {
+                k: v
+                for k, v in base.TrafficRedirector._registry.items()
+                if k != "iproute2"
+            },
+        )
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(linux, "which", lambda *a: True)
+        with pytest.raises(HotspotError, match="capture=redirect"):
+            hotspot.create_redirector("wlan0", None, base.CaptureTarget(tun="tun0"))

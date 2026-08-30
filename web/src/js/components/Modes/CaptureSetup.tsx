@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useEffect, useRef } from "react";
-import type { ServerInfo } from "../../ducks/backendState";
+import type { HotspotInfo, ServerInfo } from "../../ducks/backendState";
 import { formatAddress } from "../../utils";
 import QRCode from "qrcode";
 
@@ -23,6 +23,7 @@ function ServerDescription({
     listen_addrs,
     is_running,
     wireguard_conf,
+    hotspot,
     type,
 }: ServerInfo) {
     const qrCode = useRef(null);
@@ -58,7 +59,8 @@ function ServerDescription({
     } else {
         desc = (
             <>
-                {type === "local" ? (
+                {/* modes without a listener -- local, tun, hotspot -- have no address to show. */}
+                {type === "local" || listen_addrs.length === 0 ? (
                     <div className="text-success">{description} is active.</div>
                 ) : (
                     <div className="text-success">
@@ -71,10 +73,64 @@ function ServerDescription({
                         <canvas ref={qrCode} />
                     </div>
                 )}
+                {hotspot && <HotspotDetails {...hotspot} />}
             </>
         );
     }
     return <div>{desc}</div>;
+}
+
+/** The credentials and capture method of a running hotspot, plus a QR code to join it. */
+function HotspotDetails({
+    ssid,
+    password,
+    interface: iface,
+    address,
+    capture,
+    redirector,
+}: HotspotInfo) {
+    const qrCode = useRef(null);
+    useEffect(() => {
+        if (!qrCode.current) return;
+        // the Wi-Fi network provisioning format that phone cameras understand.
+        const escape = (s: string) => s.replace(/([\\;,":])/g, "\\$1");
+        const auth = password ? "WPA" : "nopass";
+        QRCode.toCanvas(
+            qrCode.current,
+            `WIFI:T:${auth};S:${escape(ssid)};P:${escape(password ?? "")};;`,
+            { margin: 0, scale: 3 },
+        );
+    }, [ssid, password]);
+
+    return (
+        <div className="wireguard-config">
+            <dl className="hotspot-details">
+                <dt>Network</dt>
+                <dd>{ssid}</dd>
+                {password && (
+                    <>
+                        <dt>Password</dt>
+                        <dd>{password}</dd>
+                    </>
+                )}
+                <dt>Interface</dt>
+                <dd>{iface}</dd>
+                {address && (
+                    <>
+                        <dt>Gateway</dt>
+                        <dd>{address}</dd>
+                    </>
+                )}
+                <dt>Capture</dt>
+                <dd>
+                    {redirector
+                        ? `${capture} (${redirector})`
+                        : "not intercepted"}
+                </dd>
+            </dl>
+            <canvas ref={qrCode} />
+        </div>
+    );
 }
 
 export function ServerStatus({

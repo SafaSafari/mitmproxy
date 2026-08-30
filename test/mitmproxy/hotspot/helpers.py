@@ -1,5 +1,6 @@
 """Shared test doubles for the `mitmproxy.hotspot` tests."""
 
+from mitmproxy.hotspot.base import CaptureTarget
 from mitmproxy.hotspot.base import HotspotConfig
 from mitmproxy.hotspot.base import HotspotError
 
@@ -37,6 +38,12 @@ class FakeRunner:
 
 
 def config(**kwargs) -> HotspotConfig:
-    # tests assert on exact commands, so don't let a `sudo` on PATH change them.
+    # tests assert on exact commands, so don't let the environment change them:
+    # `sudo` on PATH would add a prefix, and `capture=auto` resolves per platform.
     kwargs.setdefault("sudo", "never")
+    kwargs.setdefault("capture", "redirect")
     return HotspotConfig(**kwargs)
+
+
+def target(port: int | None = 8080, tun: str | None = None) -> CaptureTarget:
+    return CaptureTarget(port=None if tun else port, tun=tun)

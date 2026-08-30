@@ -329,9 +329,14 @@ class HotspotMode(ProxyMode):
     A Wi-Fi hotspot whose clients are transparently intercepted.
 
     mitmproxy brings up an access point using the operating system's own tooling
-    and then redirects everything its clients send into a transparent listener,
-    so that devices which cannot be configured to use a proxy can still be
-    inspected. See https://docs.mitmproxy.org/dev/concepts-modes/#hotspot.
+    and then forces everything its clients send into mitmproxy, so that devices
+    which cannot be configured to use a proxy can still be inspected.
+    See https://docs.mitmproxy.org/dev/concepts-modes/#hotspot.
+
+    With `capture=tun` -- the default wherever it is supported -- traffic is
+    routed into a tun interface that mitmproxy terminates itself, which covers
+    both TCP and UDP. With `capture=redirect` it is bent into a transparent
+    listener by the packet filter instead, which only works for TCP.
     """
 
     description = "Wi-Fi hotspot"
@@ -342,6 +347,15 @@ class HotspotMode(ProxyMode):
     def __post_init__(self) -> None:
         self.config = hotspot.HotspotConfig.parse(self.data)
         self.description = f"{self.description} ({self.config.ssid})"
+        if self.config.capture_method == "tun":
+            self.transport_protocol = BOTH
+
+    @property
+    def default_port(self) -> int | None:
+        # a tun interface is not bound to a port.
+        if self.config.capture_method == "tun":
+            return None
+        return super().default_port
 
 
 class OsProxyMode(ProxyMode):  # pragma: no cover
