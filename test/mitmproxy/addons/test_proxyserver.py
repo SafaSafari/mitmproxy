@@ -886,3 +886,19 @@ async def test_regular_http3(caplog_async, monkeypatch) -> None:
             tctx.configure(ps, server=False)
             await caplog_async.await_log("stopped")
             await _wait_for_connection_closes(ps)
+
+
+async def test_servers_are_stopped_on_shutdown():
+    """
+    Modes can own state that outlives the process, so servers must be shut down
+    explicitly rather than left to the OS to clean up.
+    """
+    ps = Proxyserver()
+    with taddons.context(ps) as tctx:
+        tctx.configure(ps, mode=["regular@0"])
+        await ps.setup_servers()
+        assert len(ps.servers) == 1
+        assert all(s.is_running for s in ps.servers)
+
+        await ps.done()
+        assert len(ps.servers) == 0

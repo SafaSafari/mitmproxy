@@ -225,6 +225,13 @@ class Proxyserver(ServerManager):
     def running(self):
         self.is_running = True
 
+    async def done(self) -> None:
+        # Shutting the servers down is not just about closing sockets, which the
+        # OS would do for us anyway. Modes can own state that outlives this
+        # process -- packet filter rules, routing entries, a persistent tun
+        # interface, a running access point -- and nothing else would undo it.
+        await self.servers.update([])
+
     def configure(self, updated) -> None:
         if "stream_large_bodies" in updated:
             try:

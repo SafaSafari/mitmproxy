@@ -362,8 +362,8 @@ class TestTunProvisioning:
         assert (name, created) == ("mitm7", True)
         assert runner.ran("ip tuntap add dev mitm7")
 
-    async def test_reuses_a_leftover_device(self, monkeypatch):
-        """A device left behind by a crash is fine to attach to, but not ours to delete."""
+    async def test_adopts_a_leftover_device(self, monkeypatch):
+        """A device left behind by a crash carries our name, so we clean it up too."""
         monkeypatch.setattr(linux, "is_root", lambda: False)
         monkeypatch.setattr(linux, "which", lambda *a: True)
 
@@ -372,7 +372,7 @@ class TestTunProvisioning:
 
         assert await linux.provision_tun_device(None, "always", exists) == (
             linux.DEFAULT_TUN_NAME,
-            False,
+            True,
         )
 
     async def test_other_errors_propagate(self, monkeypatch):

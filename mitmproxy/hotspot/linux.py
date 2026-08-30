@@ -76,10 +76,12 @@ async def provision_tun_device(
     have `sudo` pre-create a persistent device in our name and attach to that.
 
     Returns the interface name to open -- `None` lets the kernel pick one -- and
-    whether we created it, i.e. whether it has to be removed again afterwards.
+    whether the device is ours to remove again on shutdown. A persistent device
+    does not disappear when our file descriptor closes, which is the whole point
+    of it, so somebody has to.
     """
     if is_root() or not will_elevate(sudo) or not which("ip"):
-        # either we can create the device ourselves, or we have no way to ask.
+        # a device we create ourselves is not persistent and dies with the process.
         return name, False
 
     name = name or DEFAULT_TUN_NAME
@@ -98,9 +100,9 @@ async def provision_tun_device(
     except HotspotError as e:
         if "File exists" not in str(e):
             raise
-        # left over from a previous run; reuse it, but leave it alone on shutdown.
-        logger.debug(f"Reusing the existing tun interface {name}.")
-        return name, False
+        # Left behind by a run that did not get to clean up. It carries our name,
+        # so adopt it -- including the responsibility for removing it.
+        logger.debug(f"Adopting the leftover tun interface {name}.")
     return name, True
 
 

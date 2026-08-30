@@ -7,6 +7,11 @@
 
 ## Unreleased: mitmproxy next
 
+- Shut proxy servers down when mitmproxy exits instead of leaving it to the OS.
+  This matters for modes that own state outside the process -- packet filter rules,
+  routing entries, a persistent tun interface, a running access point -- which
+  previously survived a clean shutdown.
+
 - Add a `hotspot` proxy mode that creates a Wi-Fi access point and transparently
   intercepts everything its clients send, e.g. `mitmdump --mode hotspot:ssid=my-network,password=hunter22`.
   Access points are created with NetworkManager or hostapd on Linux, Internet Sharing on macOS,
