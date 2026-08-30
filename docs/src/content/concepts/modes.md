@@ -421,6 +421,7 @@ A bare value is taken as the network name, so `--mode hotspot:my-network` works 
 | `gateway` | backend default | The address clients use as their gateway. Mostly useful with `backend=manual`. |
 | `band` | `bg` | `bg` for 2.4 GHz or `a` for 5 GHz. |
 | `backend` | autodetected | Force a specific backend, see below. |
+| `sudo` | `auto` | When to run privileged commands through `sudo`. See [Privileges](#privileges). |
 | `quic` | `block` | `allow` lets clients speak QUIC. See [QUIC](#quic) below. |
 | `redirect` | `on` | `off` creates the access point but does not intercept its traffic. |
 
@@ -459,10 +460,36 @@ would sail straight past it. By default, hotspot mode therefore drops UDP port 4
 from clients, which makes browsers fall back to TCP. Pass `quic=allow` to keep
 QUIC working -- that traffic will then not be intercepted.
 
+### Privileges
+
+Creating the access point and redirecting traffic need different kinds of
+permission, which is worth knowing when mitmproxy is not running as root:
+
+- Creating the access point often works unprivileged. `nmcli`, for example, asks
+  polkit, which is why a desktop password prompt is usually enough.
+- Installing the packet filter rules does *not* go through polkit. When mitmproxy
+  is not root, it runs `nft`, `iptables`, and `pfctl` through `sudo -n` instead.
+
+`sudo -n` never prompts, so the user mitmproxy runs as needs a passwordless
+sudoers rule. For a dedicated `mitm` user on Linux that is:
+
+```
+mitm ALL=(root) NOPASSWD: /usr/sbin/nft, /usr/sbin/iptables
+```
+
+Use `sudo=never` to always run the commands directly (useful when mitmproxy is
+root already but a `sudo` binary is present), or `sudo=always` to force it.
+
+The simplest option remains running the whole thing as root:
+
+```shell
+sudo mitmdump --mode hotspot:ssid=my-network,password=hunter22
+```
+
 ### Requirements
 
 - Hotspot mode needs root privileges on Linux and macOS, and administrator
-  privileges on Windows.
+  privileges on Windows -- either directly or through `sudo`, see above.
 - Your wireless adapter must be able to act as an access point. On Linux you can
   check with `iw list | grep -A 10 "Supported interface modes"`, which should list `AP`.
 - On Windows, the redirector always uses port 8080, so keep the default listen port.

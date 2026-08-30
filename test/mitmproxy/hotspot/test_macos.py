@@ -77,7 +77,7 @@ class TestInternetSharing:
         monkeypatch.setattr(
             macos.Path, "mkdir", lambda *a, **kw: (_ for _ in ()).throw(OSError("nope"))
         )
-        with pytest.raises(HotspotError, match="needs to run as root"):
+        with pytest.raises(HotspotError, match="needs root privileges"):
             await b.start()
 
 
@@ -115,3 +115,33 @@ class TestPfRedirector:
         await r.start()
         assert r.token is None
         await r.stop()
+
+
+class TestNatPlistWriting:
+    """`/Library/Preferences` is root-only, so an unprivileged run goes via sudo."""
+
+    def backend(self, runner, tmp_path, monkeypatch, **kwargs):
+        monkeypatch.setattr(macos, "NAT_PLIST", tmp_path / "com.apple.nat.plist")
+        return macos.InternetSharingBackend(config(**kwargs), 8080, runner)
+
+    async def test_direct_write_as_root(self, tmp_path, monkeypatch):
+        runner = FakeRunner()
+        b = self.backend(runner, tmp_path, monkeypatch)
+        await b.write_config(b"payload")
+        assert macos.NAT_PLIST.read_bytes() == b"payload"
+        await b.write_config(None)
+        assert not macos.NAT_PLIST.exists()
+        assert runner.calls == []
+
+    async def test_sudo_write_when_unprivileged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(macos, "is_root", lambda: False)
+        runner = FakeRunner()
+        b = self.backend(runner, tmp_path, monkeypatch, sudo="always")
+        await b.write_config(b"payload")
+        assert runner.ran("sudo -n tee", str(macos.NAT_PLIST))
+        assert runner.stdins[-1] == "payload"
+        # nothing was written directly, the (faked) sudo call did nothing
+        assert not macos.NAT_PLIST.exists()
+
+        await b.write_config(None)
+        assert runner.ran("sudo -n rm -f", str(macos.NAT_PLIST))

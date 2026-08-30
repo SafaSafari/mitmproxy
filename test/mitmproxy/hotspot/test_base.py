@@ -75,6 +75,7 @@ class TestConfig:
         assert c.share == "eth0"
         assert c.gateway == "10.0.0.1"
         assert c.band == "a"
+        assert HotspotConfig.parse("sudo=always").sudo == "always"
 
     def test_comma_in_value(self):
         # `network` is not an option name, so it stays part of the SSID.
@@ -97,6 +98,7 @@ class TestConfig:
             ("password=short", "8 and 63"),
             ("ssid=" + "x" * 33, "1 and 32 bytes"),
             ("band=ac", "bg"),
+            ("sudo=maybe", "sudo must be one of"),
             ("backend=carrier-pigeon", "unknown backend"),
             ("backend=manual", "requires an interface"),
         ],
@@ -248,3 +250,77 @@ class TestBackendLifecycle:
         with pytest.raises(HotspotError, match="requires root") as e:
             await b.start()
         assert "Operation not permitted" in str(e.value)
+
+
+class TestElevate:
+    def test_is_root(self, monkeypatch):
+        monkeypatch.setattr(base.os, "geteuid", lambda: 0)
+        assert base.is_root()
+        monkeypatch.setattr(base.os, "geteuid", lambda: 1000)
+        assert not base.is_root()
+
+    def test_is_root_without_geteuid(self, monkeypatch):
+        # Windows has no geteuid; nothing to elevate there.
+        monkeypatch.delattr(base.os, "geteuid", raising=False)
+        assert not base.is_root()
+
+    @pytest.mark.parametrize(
+        "root,sudo_installed,mode,expected",
+        [
+            (False, True, "auto", True),
+            (False, False, "auto", False),  # no sudo binary: nothing we can do
+            (True, True, "auto", False),  # already root
+            (True, True, "never", False),
+            (True, True, "always", True),
+            (False, False, "always", True),
+        ],
+    )
+    def test_will_elevate(self, monkeypatch, root, sudo_installed, mode, expected):
+        monkeypatch.setattr(base, "is_root", lambda: root)
+        monkeypatch.setattr(base, "which", lambda *a: sudo_installed)
+        assert base.will_elevate(mode) is expected
+
+    def test_runner_is_untouched_when_not_needed(self):
+        runner = FakeRunner()
+        assert base.elevate(runner, "never") is runner
+
+    async def test_prefixes_sudo(self):
+        runner = FakeRunner()
+        elevated = base.elevate(runner, "always")
+        await elevated("nft", "-f", "-", stdin="ruleset")
+        assert runner.calls == [("sudo", "-n", "nft", "-f", "-")]
+        assert runner.stdins == ["ruleset"]
+
+    async def test_explains_missing_nopasswd(self):
+        async def needs_password(*args, **kwargs):
+            raise HotspotError("sudo: a password is required")
+
+        with pytest.raises(HotspotError, match="NOPASSWD") as e:
+            await base.elevate(needs_password, "always")("nft", "-f", "-")
+        assert "hotspot:sudo=never" in str(e.value)
+
+    async def test_other_errors_pass_through(self):
+        async def boom(*args, **kwargs):
+            raise HotspotError("nft: no such table")
+
+        with pytest.raises(HotspotError, match="no such table"):
+            await base.elevate(boom, "always")("nft", "delete", "table")
+
+    async def test_redirector_gets_the_elevated_runner(self, fake_stack):
+        backend_cls, _, log = fake_stack
+        b = backend_cls(config(sudo="always"), 8080, FakeRunner())
+        assert b.run_elevated is not b.run
+        await b.start()
+        assert log  # redirector ran, and it ran through the elevated runner
+
+    async def test_privilege_hint_is_not_duplicated(self, fake_stack, monkeypatch):
+        backend_cls, redirector_cls, log = fake_stack
+
+        async def boom(self):
+            raise HotspotError("`nft` needs root privileges, add a NOPASSWD rule")
+
+        monkeypatch.setattr(redirector_cls, "start", boom)
+        b = backend_cls(config(), 8080, FakeRunner())
+        with pytest.raises(HotspotError) as e:
+            await b.start()
+        assert str(e.value).count("root privileges") == 1

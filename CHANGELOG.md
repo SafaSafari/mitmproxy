@@ -11,6 +11,7 @@
   intercepts everything its clients send, e.g. `mitmdump --mode hotspot:ssid=my-network,password=hunter22`.
   Access points are created with NetworkManager or hostapd on Linux, Internet Sharing on macOS,
   and the Mobile Hotspot on Windows; traffic is redirected with nftables/iptables, pf, and WinDivert respectively.
+  When mitmproxy itself is not root, the privileged commands are run through `sudo -n` (configurable with `sudo=`).
 - Replace deprecated pyparsing APIs with their snake_case equivalents to avoid
   `PyparsingDeprecationWarning` during command and flow-filter parsing.
   ([#8344](https://github.com/mitmproxy/mitmproxy/pull/8344), @Dnsayhey)

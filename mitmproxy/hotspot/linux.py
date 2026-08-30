@@ -235,9 +235,6 @@ class HostapdBackend(_LinuxBackend):
         )
 
     async def start(self) -> HotspotStatus:
-        if os.geteuid() != 0:  # pragma: no cover
-            raise HotspotError("The hostapd hotspot backend must be run as root.")
-
         interface = self.interface = await self.wifi_interface()
         self.uplink = await self.default_route_interface()
         self.rundir = Path(tempfile.mkdtemp(prefix="mitmproxy-hotspot-"))
@@ -247,9 +244,9 @@ class HostapdBackend(_LinuxBackend):
         dnsmasq_conf.write_text(self.dnsmasq_conf(interface))
 
         try:
-            await self.run("ip", "link", "set", "dev", interface, "down")
-            await self.run("ip", "addr", "flush", "dev", interface)
-            await self.run(
+            await self.run_elevated("ip", "link", "set", "dev", interface, "down")
+            await self.run_elevated("ip", "addr", "flush", "dev", interface)
+            await self.run_elevated(
                 "ip",
                 "addr",
                 "add",
@@ -257,20 +254,20 @@ class HostapdBackend(_LinuxBackend):
                 "dev",
                 interface,
             )
-            await self.run("ip", "link", "set", "dev", interface, "up")
-            await self.run(
+            await self.run_elevated("ip", "link", "set", "dev", interface, "up")
+            await self.run_elevated(
                 "hostapd",
                 "-B",
                 "-P",
                 str(self.rundir / "hostapd.pid"),
                 str(hostapd_conf),
             )
-            await self.run(
+            await self.run_elevated(
                 "dnsmasq",
                 f"--conf-file={dnsmasq_conf}",
                 f"--pid-file={self.rundir / 'dnsmasq.pid'}",
             )
-            await self.run("sysctl", "-w", "net.ipv4.ip_forward=1")
+            await self.run_elevated("sysctl", "-w", "net.ipv4.ip_forward=1")
             if self.uplink:
                 await self.enable_nat(self.uplink)
         except Exception:
@@ -294,7 +291,7 @@ class HostapdBackend(_LinuxBackend):
     async def enable_nat(self, uplink: str) -> None:
         """Masquerade client traffic behind `uplink` so that clients reach the internet."""
         if which("nft"):
-            await self.run(
+            await self.run_elevated(
                 "nft",
                 "-f",
                 "-",
@@ -310,7 +307,7 @@ class HostapdBackend(_LinuxBackend):
                 ),
             )
         else:
-            await self.run(
+            await self.run_elevated(
                 "iptables",
                 "-t",
                 "nat",
@@ -324,11 +321,11 @@ class HostapdBackend(_LinuxBackend):
 
     async def disable_nat(self, uplink: str) -> None:
         if which("nft"):
-            await self.run(
+            await self.run_elevated(
                 "nft", "delete", "table", "ip", f"{TABLE_NAME}_nat", check=False
             )
         else:
-            await self.run(
+            await self.run_elevated(
                 "iptables",
                 "-t",
                 "nat",
@@ -363,7 +360,7 @@ class HostapdBackend(_LinuxBackend):
             shutil.rmtree(self.rundir, ignore_errors=True)
             self.rundir = None
         if self.interface is not None:
-            await self.run(
+            await self.run_elevated(
                 "ip",
                 "addr",
                 "del",

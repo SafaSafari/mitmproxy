@@ -21,7 +21,9 @@ rules (`--mode hotspot:backend=manual,iface=wlan0`).
 from __future__ import annotations
 
 import asyncio
+import getpass
 import logging
+import os
 import shutil
 import sys
 from abc import ABCMeta
@@ -108,6 +110,68 @@ def which(*executables: str) -> bool:
     return all(shutil.which(x) is not None for x in executables)
 
 
+SUDO_MODES = ("auto", "always", "never")
+"""Accepted values for `HotspotConfig.sudo`."""
+
+
+def is_root() -> bool:
+    """Whether we are running with full privileges already."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def will_elevate(mode: str = "auto") -> bool:
+    """
+    Whether privileged commands should be prefixed with `sudo`.
+
+    Creating the access point often works unprivileged -- NetworkManager asks
+    polkit, which is why a desktop password prompt is enough. Installing packet
+    filter rules does not go through polkit and needs real privileges, so an
+    unprivileged mitmproxy has to shell out through `sudo`.
+    """
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return not is_root() and which("sudo")
+
+
+def elevate(runner: CommandRunner, mode: str = "auto") -> CommandRunner:
+    """
+    Wrap `runner` so that it runs commands through `sudo -n` when needed.
+
+    `-n` keeps us from blocking on a password prompt that nobody would see;
+    if one would be required we explain how to grant the privileges instead.
+    """
+    if not will_elevate(mode):
+        return runner
+
+    async def run_elevated(*args: str, **kwargs) -> str:
+        try:
+            return await runner("sudo", "-n", *args, **kwargs)
+        except HotspotError as e:
+            if "password is required" in str(e) or "terminal is required" in str(e):
+                raise HotspotError(
+                    f"{' '.join(args)!r} needs root privileges, but `sudo` asked for a "
+                    f"password and mitmproxy cannot prompt for one.\n"
+                    f"Either run mitmproxy as root, or allow this user to run the "
+                    f"command without a password, e.g. by adding a sudoers rule such as\n"
+                    f"    {_username()} ALL=(root) NOPASSWD: /usr/sbin/nft, /usr/sbin/iptables\n"
+                    f"Alternatively, pass `--mode hotspot:sudo=never` to run the commands "
+                    f"directly, or `--mode hotspot:redirect=off` to skip them entirely."
+                ) from e
+            raise
+
+    return run_elevated
+
+
+def _username() -> str:
+    """The name of the user we are running as, for use in error messages."""
+    try:
+        return getpass.getuser()
+    except Exception:  # pragma: no cover
+        return "youruser"
+
+
 @dataclass(frozen=True)
 class HotspotConfig:
     """The parsed configuration of a `hotspot` mode spec."""
@@ -131,6 +195,13 @@ class HotspotConfig:
     """`bg` for 2.4 GHz or `a` for 5 GHz. Backend default if unset."""
     backend: str | None = None
     """Force a specific backend instead of picking the best available one."""
+    sudo: str = "auto"
+    """
+    When to run privileged commands through `sudo`.
+
+    `auto` uses it whenever mitmproxy itself is not root, `always` and `never`
+    force the decision.
+    """
     redirect: bool = True
     """Install the rules that force client traffic through mitmproxy."""
     block_quic: bool = True
@@ -153,6 +224,7 @@ class HotspotConfig:
         "gw": "gateway",
         "band": "band",
         "backend": "backend",
+        "sudo": "sudo",
         "redirect": "redirect",
         "quic": "block_quic",
     }
@@ -216,6 +288,8 @@ class HotspotConfig:
             )
         if self.band is not None and self.band not in ("bg", "a"):
             raise ValueError("band must be either 'bg' (2.4 GHz) or 'a' (5 GHz)")
+        if self.sudo not in SUDO_MODES:
+            raise ValueError(f"sudo must be one of {', '.join(SUDO_MODES)}")
         if self.backend is not None and self.backend not in BACKEND_NAMES:
             raise ValueError(
                 f"unknown backend {self.backend!r}, expected one of {', '.join(BACKEND_NAMES)}"
@@ -310,6 +384,9 @@ class HotspotBackend(_Registry, metaclass=ABCMeta):
         self.config = config
         self.redirect_port = redirect_port
         self.run = runner
+        """Runs commands as ourselves. Use it for queries and for polkit-aware tools."""
+        self.run_elevated = elevate(runner, config.sudo)
+        """Runs commands as root. Use it for anything the kernel gates on privileges."""
         self.redirector: TrafficRedirector | None = None
 
     @abstractmethod
@@ -343,18 +420,24 @@ class HotspotBackend(_Registry, metaclass=ABCMeta):
             gateway=status.address,
             port=self.redirect_port,
             block_quic=self.config.block_quic,
-            runner=self.run,
+            # packet filter rules are not something polkit hands out, so these
+            # commands go through sudo when mitmproxy itself is unprivileged.
+            runner=self.run_elevated,
         )
         try:
             await self.redirector.start()
         except HotspotError as e:
-            # by far the most common cause is a missing sudo, so say so.
-            raise HotspotError(
-                f"Failed to redirect hotspot traffic: {e}\n"
-                f"Installing the redirection rules requires root (administrator on "
-                f"Windows) privileges. Pass `--mode hotspot:redirect=off` to run the "
-                f"access point without intercepting its traffic."
-            ) from e
+            # `elevate` already explains privileges in detail; don't repeat ourselves.
+            hint = (
+                ""
+                if "root privileges" in str(e)
+                else (
+                    f"\nInstalling the redirection rules requires root (administrator "
+                    f"on Windows) privileges. Pass `--mode hotspot:redirect=off` to run "
+                    f"the access point without intercepting its traffic."
+                )
+            )
+            raise HotspotError(f"Failed to redirect hotspot traffic: {e}{hint}") from e
         status.redirector = self.redirector.name
 
     async def stop_redirector(self) -> None:

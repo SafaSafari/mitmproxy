@@ -19,8 +19,10 @@ from pathlib import Path
 from mitmproxy.hotspot.base import HotspotBackend
 from mitmproxy.hotspot.base import HotspotError
 from mitmproxy.hotspot.base import HotspotStatus
+from mitmproxy.hotspot.base import is_root
 from mitmproxy.hotspot.base import TrafficRedirector
 from mitmproxy.hotspot.base import which
+from mitmproxy.hotspot.base import will_elevate
 
 logger = logging.getLogger(__name__)
 
@@ -94,17 +96,11 @@ class InternetSharingBackend(HotspotBackend):
         except OSError:
             self.previous_config = None
 
-        try:
-            NAT_PLIST.parent.mkdir(parents=True, exist_ok=True)
-            NAT_PLIST.write_bytes(plistlib.dumps(self.nat_settings(uplink)))
-        except OSError as e:
-            raise HotspotError(
-                f"Cannot write {NAT_PLIST}: {e}. Hotspot mode needs to run as root on macOS."
-            ) from e
+        await self.write_config(plistlib.dumps(self.nat_settings(uplink)))
 
         try:
-            await self.run("launchctl", "enable", SERVICE, check=False)
-            await self.run("launchctl", "kickstart", "-k", SERVICE)
+            await self.run_elevated("launchctl", "enable", SERVICE, check=False)
+            await self.run_elevated("launchctl", "kickstart", "-k", SERVICE)
         except HotspotError as e:
             await self.restore_config()
             raise HotspotError(
@@ -129,22 +125,44 @@ class InternetSharingBackend(HotspotBackend):
             raise
         return status
 
+    async def write_config(self, data: bytes | None) -> None:
+        """
+        Replace the Internet Sharing configuration, or remove it when `data` is None.
+
+        `/Library/Preferences` is only writable by root, so an unprivileged
+        mitmproxy has to go through `sudo` here just like it does for `pf`.
+        """
+        elevated = not is_root() and will_elevate(self.config.sudo)
+        try:
+            if data is None:
+                if elevated:
+                    await self.run_elevated("rm", "-f", str(NAT_PLIST))
+                else:
+                    NAT_PLIST.unlink(missing_ok=True)
+            elif elevated:
+                await self.run_elevated("tee", str(NAT_PLIST), stdin=data.decode())
+            else:
+                NAT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+                NAT_PLIST.write_bytes(data)
+        except OSError as e:
+            raise HotspotError(
+                f"Cannot write {NAT_PLIST}: {e}. "
+                f"Hotspot mode needs root privileges on macOS."
+            ) from e
+
     async def restore_config(self) -> None:
         """Put the previous Internet Sharing configuration back in place."""
         try:
-            if self.previous_config is None:
-                NAT_PLIST.unlink(missing_ok=True)
-            else:
-                NAT_PLIST.write_bytes(self.previous_config)
-        except OSError as e:  # pragma: no cover
+            await self.write_config(self.previous_config)
+        except HotspotError as e:  # pragma: no cover
             logger.debug(f"Failed to restore {NAT_PLIST}: {e}")
         finally:
             self.previous_config = None
 
     async def stop(self) -> None:
         await self.stop_redirector()
-        await self.run("launchctl", "kill", "SIGTERM", SERVICE, check=False)
-        await self.run("launchctl", "disable", SERVICE, check=False)
+        await self.run_elevated("launchctl", "kill", "SIGTERM", SERVICE, check=False)
+        await self.run_elevated("launchctl", "disable", SERVICE, check=False)
         await self.restore_config()
 
 

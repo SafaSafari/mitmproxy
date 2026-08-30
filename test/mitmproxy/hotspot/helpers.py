@@ -37,4 +37,6 @@ class FakeRunner:
 
 
 def config(**kwargs) -> HotspotConfig:
+    # tests assert on exact commands, so don't let a `sudo` on PATH change them.
+    kwargs.setdefault("sudo", "never")
     return HotspotConfig(**kwargs)
